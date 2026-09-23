@@ -1,0 +1,285 @@
+name: CI
+
+# 三条独立流水线，对应 README 第五节「已验证通过」里可以零配置复跑的三项。
+#
+# 设计原则：
+#   1. 不依赖任何密钥。LLM key、数据库口令全部为空时项目必须能跑（降级路径）。
+#   2. 能用 H2 就不用 MySQL。单元测试与冒烟测试都跑在 dev profile 上。
+#   3. 外部行情接口不可达时**不能**让流水线变红——那是上游的问题，不是代码的问题。
+#      所以 integration job 会先探测上游，探不到就明确跳过并说明原因，而不是假装通过。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-unit:
+    name: 后端单元测试 + 真 Redis 集成（247 项）
+    runs-on: ubuntu-latest
+
+    # ---------------------------------------------------------------
+    # 为什么这里要起一个真 Redis：
+    # RedisTokenBucketRateLimiter 的 Lua 脚本是分布式限流唯一不可替代的部分，
+    # 用替身只能验证 Java 侧换算，脚本一行都跑不到。GitHub Actions 的
+    # service container 直接跑在 runner 上，不需要 Docker-in-Docker，
+    # 也不需要引 Testcontainers 那一整棵依赖树（本项目要求离线可构建）。
+    #
+    # health check 不能省：不等就绪就起 JVM，会看到「Redis 测试全跳过」的假绿。
+    # ---------------------------------------------------------------
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    env:
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: '6379'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: mvn test
+        working-directory: backend
+        run: mvn -B -ntp test
+
+      # ---------------------------------------------------------------
+      # 这一道守卫比 mvn test 本身更重要。
+      #
+      # RedisTokenBucketRateLimiterRedisTest 在连不上 Redis 时会把每个用例
+      # 标记为「跳过」而不是失败——这是对的（缺环境不是代码问题），
+      # 但它也意味着「Redis 没起来」会表现为一个全绿的 job，
+      # 而真 Redis 验证其实一次都没跑。这条守卫把那种假绿变成红。
+      #
+      # 顺带说明：统计必须数 <testcase> 子元素，不能读 <testsuite tests="...">，
+      # 后者会少计（本仓库实测 242 vs 247）。
+      # ---------------------------------------------------------------
+      - name: 守卫：真 Redis 集成测试必须真的跑过
+        working-directory: backend
+        run: |
+          python3 - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+
+          files = glob.glob("target/surefire-reports/TEST-*RedisTokenBucketRateLimiterRedisTest*.xml")
+          if not files:
+              sys.exit("::error::未找到真 Redis 集成测试的报告文件，该测试类可能根本没被执行")
+
+          total = skipped = 0
+          for path in files:
+              root = ET.parse(path).getroot()
+              for case in root.iter("testcase"):
+                  total += 1
+                  if case.find("skipped") is not None:
+                      skipped += 1
+
+          print(f"真 Redis 集成测试：共 {total} 项，执行 {total - skipped} 项，跳过 {skipped} 项")
+          if total == 0:
+              sys.exit("::error::真 Redis 集成测试一项都没发现")
+          if skipped:
+              sys.exit("::error::真 Redis 集成测试被跳过（Redis 服务可能没就绪），Lua 脚本这次没有被验证到")
+          PY
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: backend/target/surefire-reports/
+          if-no-files-found: ignore
+
+  frontend-build:
+    name: 前端类型检查 + 生产构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # 用 npm ci 而不是 npm install：锁文件是本次提交的一部分，
+      # CI 必须复现本地那份依赖树，否则 TS / Vite 的版本坑会再次悄悄溜回来。
+      - name: npm ci
+        working-directory: frontend
+        run: npm ci
+
+      # typecheck 必须独立成步，不能只靠 build——build 脚本虽然先跑 typecheck，
+      # 但分开跑能让失败原因在 Actions 界面上直接可读。
+      - name: 类型检查
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: 生产构建
+        working-directory: frontend
+        run: npm run build:only
+
+      - name: 打印产物体积
+        working-directory: frontend
+        run: ls -lh dist/assets/ | sort -k5 -h | tail -8
+
+  integration:
+    name: 后端冒烟 + WebSocket（依赖公网行情接口）
+    runs-on: ubuntu-latest
+    needs: backend-unit
+
+    # ---------------------------------------------------------------
+    # 这一条把 Redis 分布式限流接进真实 HTTP 栈一起跑冒烟。
+    #
+    # 单元测试证明的是「Lua 脚本本身对不对」；这里要证明的是
+    # 「RATE_LIMIT_STORE=redis 时整条链路真的通」——
+    # 装配（RateLimitConfig 选到 Redis 实现）、切面、Lua、
+    # 真实业务请求，四者串起来。这一段在本地永远验证不了（本机没有 Redis）。
+    # ---------------------------------------------------------------
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 打包（跳过测试，测试已在上一个 job 跑过）
+        working-directory: backend
+        run: mvn -B -ntp -Dmaven.test.skip=true package
+
+      # ---------------------------------------------------------------
+      # 上游探测。冒烟测试里有 2 条断言需要真实上游数据（搜索、资讯 feed），
+      # 公网受限时必然失败。区分「代码坏了」和「网络上不去」很重要，
+      # 否则一条红叉会让人去查根本不存在的 bug。
+      #
+      # 探测结果写进 GITHUB_ENV 的 SKIP_UPSTREAM，冒烟脚本据此把那 2 条
+      # 记为 SKIP 而不是 PASS —— 跳过就是跳过，不能算通过。
+      # ---------------------------------------------------------------
+      - name: 探测上游行情接口可达性
+        run: |
+          ok=yes
+          for host in https://searchapi.eastmoney.com https://datacenter-web.eastmoney.com; do
+            if curl -sS --max-time 8 -o /dev/null "$host"; then
+              echo "可达: $host"
+            else
+              echo "不可达: $host"
+              ok=no
+            fi
+          done
+          if [ "$ok" = "yes" ]; then
+            echo "SKIP_UPSTREAM=0" >> "$GITHUB_ENV"
+            echo "上游可达，将跑完整的 50 项断言。"
+          else
+            echo "SKIP_UPSTREAM=1" >> "$GITHUB_ENV"
+            echo "::notice::上游不可达，冒烟测试降级为 48 项断言 + 2 项 SKIP"
+          fi
+
+      - name: 启动后端（dev profile / H2 内存库 / Redis 分布式限流 / 8080）
+        run: |
+          nohup env RATE_LIMIT_STORE=redis \
+            java -jar backend/target/stock-analyst-backend.jar \
+            --spring.profiles.active=dev --server.port=8080 \
+            > backend.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/actuator/health >/dev/null; then
+              echo "后端已就绪（第 ${i} 次探测）"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "后端 120 秒内未就绪，最后 80 行日志："
+          tail -80 backend.log
+          exit 1
+
+      # 装配选错实现（回退成内存桶）时整段 Redis 验证就白做了，
+      # 所以直接检查启动日志里的那一行。
+      - name: 确认后端真的选了 Redis 限流实现
+        run: |
+          if grep -q "限流器：Redis 分布式令牌桶" backend.log; then
+            echo "已确认：限流器 = Redis 分布式令牌桶"
+          else
+            echo "启动日志里没有「限流器：Redis 分布式令牌桶」，实际选中的是："
+            grep -a "限流器：" backend.log || echo "（一行都没有，限流器根本没装配）"
+            exit 1
+          fi
+
+      - name: 冒烟测试（完整 50 项 / 降级 48 项 + 2 项 SKIP）
+        run: BASE=http://localhost:8080 bash backend/scripts/smoke-test.sh
+
+      - name: WebSocket 协议验证（12 项断言）
+        run: node backend/scripts/ws-check.mjs ws://localhost:8080/ws/quote
+
+      # ---------------------------------------------------------------
+      # 直接证据：冒烟测试的写请求必须真的在 Redis 里留下了令牌桶键。
+      #
+      # 前面两条只证明「装配对了」和「接口正常返回」，都不排除
+      # 「限流器被调用但走的是 fail-open 分支」——Redis 一旦连不上，
+      # 限流器会静默放行且接口全部 200，冒烟测试照样全绿。
+      # 桶键存在才是「Lua 真的执行过」的物证。
+      # ---------------------------------------------------------------
+      - name: 确认 Redis 里真的写下了令牌桶键
+        run: |
+          keys=$(docker exec "${{ job.services.redis.id }}" \
+            redis-cli --scan --pattern 'stockanalyst:rl:*' | head -5)
+          count=$(docker exec "${{ job.services.redis.id }}" \
+            redis-cli --scan --pattern 'stockanalyst:rl:*' | wc -l)
+          echo "令牌桶键数量：$count"
+          echo "$keys"
+          if [ "$count" -eq 0 ]; then
+            echo "Redis 里一个限流键都没有：限流器要么没被调用，要么一直在 fail-open 放行"
+            tail -60 backend.log
+            exit 1
+          fi
+
+      - name: 导出接口返回的数据源状态
+        if: always()
+        run: |
+          echo "--- /quote/source ---"
+          curl -s http://localhost:8080/api/v1/quote/source || true
+          echo
+          echo "--- 本次 SKIP_UPSTREAM=$SKIP_UPSTREAM ---"
+
+      - name: 失败时上传后端日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-log
+          path: backend.log
+          if-no-files-found: ignore
+
+      - name: 停后端
+        if: always()
+        run: pkill -f stock-analyst-backend.jar || true

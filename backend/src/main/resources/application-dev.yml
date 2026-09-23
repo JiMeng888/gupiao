@@ -1,0 +1,81 @@
+# ============================================================================
+# 开发 profile（默认）：H2 内存库
+#
+# 目标：clone 下来直接 `mvn spring-boot:run` 就能跑通全部接口，不需要装
+#      MySQL、不需要建库、不需要任何密钥。
+#
+# 数据特征：进程退出即清空。每次启动都是干净的初始状态——
+#          这对演示与调试是优点，对「想保留自选股」是缺点。
+#          要持久化请用 -Dspring.profiles.active=mysql。
+# ============================================================================
+
+spring:
+  datasource:
+    # DB_CLOSE_DELAY=-1：JVM 存活期间保持库不被关闭（否则最后一个连接关闭就清空）
+    # DB_CLOSE_ON_EXIT=FALSE：交给 JVM 退出流程处理，避免关闭钩子抛异常
+    url: jdbc:h2:mem:stockanalyst;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  sql:
+    init:
+      # always：显式声明，不依赖「嵌入式数据库才初始化」的隐式规则
+      mode: always
+      schema-locations: classpath:db/schema-h2.sql
+      continue-on-error: false
+
+  h2:
+    console:
+      # 开发期可直接访问 http://localhost:8080/h2-console 查看表数据
+      # JDBC URL 填上面的 url，用户名 sa，密码留空
+      # 生产环境务必保持关闭：它没有任何鉴权
+      enabled: true
+      path: /h2-console
+
+# ---------------------------------------------------------------------------
+# 开发用密钥。
+#
+# 这是公开在版本库里的字符串，任何人都能伪造令牌，**只能用于本地开发**。
+# 其它 profile 不提供默认值，缺少 APP_JWT_SECRET 时应用会因校验失败直接退出。
+# ---------------------------------------------------------------------------
+app:
+  jwt:
+    secret: dev-only-insecure-secret-change-me-in-any-real-deployment-0123456789
+
+  # -------------------------------------------------------------------------
+  # 开发/测试档限流额度。
+  #
+  # 为什么必须在 dev 里单独放宽：`scripts/smoke-test.sh` 会在一分钟内连续打出
+  # 三十来次**写请求**（注册 3 次、登录、刷新、改密、分组增删、买入/卖出/删除、
+  # 三次 AI 分析……），这些全部落在 STRICT 桶里。生产默认的 20/min + 突发 10
+  # 合计只能放行约 25 次，于是脚本跑到后半段就开始收 429——
+  # 表现为「同一份代码，跑得快就全过，跑得慢或重跑就报错」，是最难受的一类假失败。
+  #
+  # 注意这里**没有把 enabled 关掉**。关掉就等于在 dev 里彻底不执行限流代码路径，
+  # 那样连「限流器有没有正确装配」都验证不到，等于把问题藏起来。
+  # 正确做法是留一个足够大的额度：逻辑照跑，但不误伤自动化测试。
+  #
+  # 限流算法本身的口径由 InMemoryTokenBucketRateLimiterTest 单测覆盖（不依赖本配置）。
+  # -------------------------------------------------------------------------
+  rate-limit:
+    enabled: true
+    strict-rate-per-min: 3000
+    strict-burst: 500
+    loose-rate-per-min: 6000
+    loose-burst: 1000
+
+logging:
+  level:
+    com.stocklab.analyst: DEBUG
+
+mybatis-plus:
+  global-config:
+    banner: false
+    db-config:
+      # 主键由应用侧生成 UUID（实体上也标注了 @TableId(ASSIGN_UUID)，
+      # 这里再声明一次是作为全局兜底：新增实体忘记标注时行为仍一致）
+      id-type: assign_uuid
+  # 需要看真实 SQL 与参数时打开下面这行（会同时打印结果集，日志量很大）：
+  # configuration:
+  #   log-impl: org.apache.ibatis.logging.stdout.StdOutImpl

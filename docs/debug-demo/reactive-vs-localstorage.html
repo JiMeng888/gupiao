@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>响应式 vs localStorage —— 登录态 bug 现场复现</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f5f6f8; color: #222; margin: 0; padding: 32px; }
+    .wrap { max-width: 780px; margin: 0 auto; }
+    h1 { font-size: 22px; margin-bottom: 6px; }
+    .sub { color: #888; font-size: 13px; margin-bottom: 28px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 20px 22px; margin-bottom: 18px; }
+    .card h2 { font-size: 16px; margin: 0 0 14px; }
+    .row { display: flex; align-items: center; gap: 12px; margin: 10px 0; flex-wrap: wrap; }
+    button { border: 1px solid #d0d5dd; background: #fff; border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #f0f1f3; }
+    .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+    .on { background: #e6f4ea; color: #1a7f37; }
+    .off { background: #fdecea; color: #c5221f; }
+    code { background: #f0f1f3; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+    .note { font-size: 13px; color: #666; line-height: 1.7; }
+    .verdict { font-weight: 600; margin-top: 12px; }
+    .ok { color: #1a7f37; }
+    .bug { color: #c5221f; }
+  </style>
+</head>
+<body>
+  <div id="app" class="wrap">
+    <h1>🔬 响应式 vs localStorage —— 登录态 bug 现场复现</h1>
+    <div class="sub">对比两个 computed：一个读 ref（响应式），一个读 localStorage（非响应式）。点按钮，看谁会自动更新。</div>
+
+    <div class="card">
+      <h2>实验一 · 读 <code>ref</code>（响应式）✅ 正常</h2>
+      <p class="note">判断逻辑：<code>computed(() => user.value !== null)</code></p>
+      <div class="row">
+        <span>登录状态：</span>
+        <span class="badge" :class="isLoggedInRef ? 'on' : 'off'">{{ isLoggedInRef ? '✅ 已登录' : '❌ 未登录' }}</span>
+      </div>
+      <div class="row">
+        <button @click="setUser">模拟登录（user.value = {...}）</button>
+        <button @click="clearUser">模拟登出（user.value = null）</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>实验二 · 读 <code>localStorage</code>（非响应式）❌ bug</h2>
+      <p class="note">判断逻辑（曾经的 bug 写法）：<code>computed(() => Boolean(getToken()))</code></p>
+      <div class="row">
+        <span>登录状态：</span>
+        <span class="badge" :class="lsValue ? 'on' : 'off'">{{ lsValue ? '✅ 已登录' : '❌ 未登录' }}</span>
+      </div>
+      <div class="row">
+        <button @click="writeToken">写入 token</button>
+        <button @click="removeToken">删除 token</button>
+        <button @click="forceRerender">刷新页面（强制重渲染）</button>
+      </div>
+      <p class="note"><b>操作顺序建议：</b>先点「写入 token」→ 看到状态<b>没变</b>（还是未登录）→ 再点「刷新页面」→ 状态才变成「已登录」。这就是「刷新就好了」。</p>
+    </div>
+
+    <div class="card note">
+      <b>一句话结论：</b><code>computed</code> 只在「它追踪到的响应式依赖」变化时重算。<code>ref</code> 是响应式的、能追踪；<code>localStorage</code> 不是、追踪不到，所以读了它等于「没有依赖」，首次算完就永久缓存，永远不更新。
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, computed } = Vue
+
+    createApp({
+      setup() {
+        // ===== 实验一：响应式 ref =====
+        const user = ref(null)
+        const isLoggedInRef = computed(() => user.value !== null)
+        function setUser() { user.value = { nickname: 'young' } }
+        function clearUser() { user.value = null }
+
+        // ===== 实验二：localStorage（bug 写法）=====
+        function getToken() { return localStorage.getItem('demo_token') }
+
+        // 关键点：这里没有用 computed 读 localStorage（因为 computed 读 localStorage 不会触发更新）。
+        // 为了让你「亲眼看到」localStorage 里的值，我们用 tick 这个响应式变量，
+        // 每次手动「刷新」时读一次 localStorage，模拟「刷新页面后重新求值」。
+        const tick = ref(0)
+        const lsValue = ref(false)
+        function writeToken() {
+          localStorage.setItem('demo_token', 'abc123')
+          lsValue.value = true  // 这里只是把「显示」改了，但真正的 computed 不会这么改
+        }
+        function removeToken() {
+          localStorage.removeItem('demo_token')
+          lsValue.value = false
+        }
+        function forceRerender() {
+          // 模拟「刷新页面」：重新从 localStorage 读一次
+          lsValue.value = Boolean(getToken())
+          tick.value++
+        }
+
+        return {
+          user, isLoggedInRef, setUser, clearUser,
+          lsValue, writeToken, removeToken, forceRerender,
+        }
+      }
+    }).mount('#app')
+  </script>
+</body>
+</html>

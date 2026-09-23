@@ -1,0 +1,32 @@
+{
+  "name": "stock-analyst-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "股票分析师 · 前端（PC 宽屏版）。Vue3 + TypeScript + Vite + Element Plus + ECharts",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "build:only": "vite build",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "typecheck:src": "vue-tsc --noEmit -p tsconfig.json",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "axios": "^1.20.0",
+    "echarts": "^6.1.0",
+    "element-plus": "^2.14.5",
+    "pinia": "^4.0.3",
+    "vue": "^3.5.43",
+    "vue-router": "^5.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "typescript": "~6.0.3",
+    "vite": "^8.3.0",
+    "vue-tsc": "^3.3.11"
+  }
+}

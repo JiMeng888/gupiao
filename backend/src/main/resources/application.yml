@@ -1,0 +1,172 @@
+# ============================================================================
+# 股票分析师系统 · 主配置
+#
+# 本文件只放「与环境无关」的配置。所有敏感项与随环境变化的值都通过环境变量
+# 注入（写成 ${ENV_VAR:默认值}），默认值仅适用于本地开发。
+#
+# 启动前请先看两件事：
+#   1. 默认 profile 是 dev（H2 内存库，零依赖即可拉起）。
+#      连 MySQL 请用 --spring.profiles.active=mysql，并配好 DB_URL / DB_USERNAME / DB_PASSWORD。
+#   2. APP_JWT_SECRET 在 dev 下有内置的开发密钥；其它 profile 必须显式提供，
+#      否则会因为不满足 @Size(min=32) 而启动失败——这是刻意设计的快速失败。
+# ============================================================================
+
+server:
+  port: 8080
+  shutdown: graceful
+  # 错误响应统一由 GlobalExceptionHandler 产出，不让容器再吐默认错误页，
+  # 避免出现两套格式不同的错误体
+  error:
+    include-message: never
+    include-stacktrace: never
+    include-binding-errors: never
+    whitelabel:
+      enabled: false
+
+spring:
+  application:
+    name: stock-analyst-backend
+
+  profiles:
+    default: dev
+
+  lifecycle:
+    # 优雅停机：等正在处理的分析请求（可能 40 秒）跑完再退出。
+    # 用 kill -9 强杀时该配置无效，容器环境请确保发 SIGTERM
+    timeout-per-shutdown-phase: 45s
+
+  jackson:
+    # epoch 毫秒的时间戳由我们自己格式化，不使用全局日期序列化策略。
+    # 只关掉「空字符串转 null 对象」的行为，避免前端传 "" 时静默变成 null
+    deserialization:
+      accept-empty-string-as-null-object: false
+
+app:
+  jwt:
+    # 仅从环境变量注入。HS256 需要至少 256 bit（32 字节）密钥
+    secret: ${APP_JWT_SECRET:}
+    issuer: stock-analyst
+    access-token-ttl: 30m
+    refresh-token-ttl: 30d
+
+  market-data:
+    # eastmoney：东方财富公开接口（真实行情）
+    # mock：内置确定性演示数据（离线可用，无网络依赖）
+    provider: ${MARKET_DATA_PROVIDER:eastmoney}
+    # 降级链（provider 非 mock 时）：eastmoney → tencent → mock。
+    # tencent（腾讯行情）是备用真实源：东财存在 IP 级风控（服务端直接断连，
+    # 实测 2026-09-19 / 2026-09-21），触发时报价/K 线/指数由腾讯继续提供真实数据；
+    # 搜索与榜单腾讯无对应能力，这两项落 mock 演示数据。
+    # 单次行情请求超时。设得比页面等待时间短，宁可降级也不要挂住线程
+    timeout: 6s
+    # 真实源请求失败后的冷却时长：冷却期内跳过该源直接用下一级，
+    # 到期自动放行探测。避免上游被风控/宕机时每个请求都先白等一次失败。
+    # 设为 0s 禁用。
+    upstream-cooldown: 30s
+    # 报价缓存 3 秒：把同一秒内「首页 N 个组件各自取价」折叠成一次上游请求
+    quote-ttl: 3s
+    # K 线缓存 5 分钟：日内不频繁变化
+    bar-ttl: 5m
+    # 启动后异步预热全 A 股代码清单（搜索依赖它）。
+    # 用 ApplicationReadyEvent 触发，不拖慢启动
+    warmup-on-boot: true
+    # 上游故障时降级为演示数据。开启后接口不会因上游抖动而整体不可用，
+    # 但响应里会标记数据源，前端需据此提示用户
+    fallback-to-mock: true
+
+  llm:
+    # deepseek / qwen / openai / mock
+    provider: ${LLM_PROVIDER:deepseek}
+    # 留空则始终走规则化报告（不产生任何外部费用）
+    api-key: ${LLM_API_KEY:}
+    # 覆盖服务商默认地址。注意不要带 /v1 后缀，路径由代码拼接
+    base-url: ${LLM_BASE_URL:}
+    model: ${LLM_MODEL:}
+    # 大模型生成长文本需要 10~40 秒，与行情源的 6 秒完全不同量级
+    timeout: 45s
+    max-tokens: 1500
+
+  session:
+    # memory：单副本内存黑名单（默认）；redis：多实例共享，登出跨实例立即生效。
+    #
+    # 为什么默认是 memory 而不是 redis：redis 会引入一个运行时依赖，
+    # 默认值不该让「不配任何东西直接启动」失败。
+    # 但代价必须说清楚——**默认配置下多副本部署时，在 A 实例登出的会话
+    # 拿到 B 实例仍然可用**。启动日志里会为此打 WARN，别忽略它。
+    store: ${SESSION_STORE:memory}
+    key-prefix: stockanalyst:revoked
+
+  rate-limit:
+    enabled: true
+    # memory：单机内存令牌桶（默认）；redis：多实例共享配额（需 Redis 可用）
+    store: ${RATE_LIMIT_STORE:memory}
+    key-prefix: stockanalyst
+    # 严格桶：登录注册、写操作、AI 分析
+    strict-rate-per-min: 20
+    strict-burst: 10
+    # 宽松桶：行情、K 线、指标、资讯等只读接口
+    # 单个详情页会并发发起十几个请求，桶开得太小会误伤正常使用
+    loose-rate-per-min: 600
+    loose-burst: 120
+    # 是否信任 X-Forwarded-For。默认关闭：该请求头由客户端完全可控，
+    # 未部署在受信反代之后时开启等于直接给出绕过限流的方法。
+    # 开启前请确认反代使用 proxy_set_header X-Forwarded-For $remote_addr（覆盖而非追加）
+    trust-forwarded-header: false
+    client-ip-header: X-Forwarded-For
+
+  cors:
+    # 使用 patterns 而非固定列表：allowCredentials=true 时不允许 Access-Control-Allow-Origin: *，
+    # 用 pattern 才能按请求 Origin 回显具体值
+    allowed-origin-patterns:
+      - http://localhost:*
+      - http://127.0.0.1:*
+    allow-credentials: true
+    max-age-seconds: 3600
+
+  ws:
+    # 实时行情推送间隔。定时任务用 fixedDelay，上一轮结束后再等这个时间，
+    # 负载变高时推送周期会自动拉长而不是堆积
+    push-interval: 3s
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+    # 行情接口的响应体较长，默认的折叠深度不利于调试
+    default-models-expand-depth: 1
+  default-produces-media-type: application/json
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # prometheus 需要 micrometer-registry-prometheus（已引入）
+        include: health,info,metrics,prometheus
+  health:
+    redis:
+      # Redis 在本项目里是可选依赖：只有 app.rate-limit.store=redis 时才用到。
+      # spring-data-redis 在 classpath 上会让 Boot 自动注册 Redis 健康检查，
+      # 本机没装 Redis 时整体状态就变成 DOWN，容器编排与负载均衡会误判
+      # 这个服务已经不可用。因此默认关闭；真正启用 Redis 限流时再打开。
+      enabled: false
+  endpoint:
+    health:
+      # 默认不暴露数据库/磁盘等细节，避免健康检查端点成为信息泄漏面
+      show-details: never
+  metrics:
+    tags:
+      application: stock-analyst
+    distribution:
+      # 打开 HTTP 分位统计，便于判断「AI 分析接口把 P99 拉到了多少」
+      percentiles-histogram:
+        http.server.requests: true
+
+logging:
+  level:
+    root: INFO
+    com.stocklab.analyst: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"

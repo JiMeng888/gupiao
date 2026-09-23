@@ -1,0 +1,160 @@
+# ---------------------------------------------------------------------------
+# 一键起全栈：MySQL 8 + Redis 7 + 后端 + 前端(Nginx)
+#
+# 用法：
+#   cd deploy
+#   export JWT_SECRET='至少32字符的随机串'     # 必须设置，否则后端启动即失败
+#   export MYSQL_ROOT_PASSWORD='你的库密码'
+#   export LLM_API_KEY='...'                  # 可选；不配则 AI 分析降级为规则引擎
+#   docker compose up -d --build
+#   浏览器打开 http://localhost:8088
+#
+# 首次启动后端的 sql.init.mode 是 never，所以数据库表需要先建好，
+# 建表语句在 backend/src/main/resources/db/schema-mysql.sql。
+# 下面 db-init 这个一次性服务负责这件事。
+# ---------------------------------------------------------------------------
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: stocklab-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?必须在 deploy/.env 或环境变量中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: stocklab
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # 显式设置 wait_timeout：Hikari 的 max-lifetime(1700s) 必须小于它，
+      # 否则连接会被服务端先掐断，表现为偶发的 "Communications link failure"
+      - --wait-timeout=28800
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      # 只在需要从宿主机连库调试时暴露；生产环境建议删掉这一行。
+      # 默认 3307 避开本机已有的 MySQL(3306)；容器间后端连 MySQL 走内部网络
+      # mysql:3306，不经过这里，改宿主端口无影响。
+      - "${MYSQL_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [stocklab]
+
+  # ---------------------------------------------------------------------------
+  # 一次性建表服务。
+  #
+  # 不用 spring.sql.init 的原因：那要求应用账号具备 DDL 权限，
+  # 而生产上应用账号应当只有 DML 权限（见 schema-mysql.sql 末尾的说明）。
+  # 交给一个一次性容器执行，应用账号就没有建表能力。
+  # ---------------------------------------------------------------------------
+  db-init:
+    image: mysql:8.0
+    container_name: stocklab-db-init
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_PWD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ../backend/src/main/resources/db/schema-mysql.sql:/schema.sql:ro
+    # IF NOT EXISTS 语义由脚本内的建表语句保证，重复执行是安全的。
+    #
+    # 为什么带重试循环：MySQL 8 官方镜像首次启动会先起「临时 server」做初始化
+    # （建库、设 root 密码），完成后 shutdown 再正式启动。healthcheck 的
+    # mysqladmin ping 在临时 server 阶段就返回成功，导致 depends_on 过早放行，
+    # 此时真 server 还在重启，直连会 Can't connect (111)。所以这里连不上时
+    # 退避重试，而不是一次失败就退出。
+    entrypoint: ["sh", "-c", "for i in $$(seq 1 30); do if mysql -h mysql -uroot stocklab < /schema.sql; then echo '建表完成'; exit 0; fi; echo \"第 $$i 次连接失败，2 秒后重试...\"; sleep 2; done; echo '建表失败：多次重试仍连不上 MySQL'; exit 1"]
+    restart: "no"
+    networks: [stocklab]
+
+  redis:
+    image: redis:7-alpine
+    container_name: stocklab-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [stocklab]
+
+  backend:
+    build:
+      context: ../backend
+    container_name: stocklab-backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # 等建表完成再启动，避免启动瞬间查不到表
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      SPRING_PROFILES_ACTIVE: mysql
+      TZ: Asia/Shanghai
+
+      # 数据库。后端读的是完整 JDBC URL（application-mysql.yml 的 ${DB_URL}），
+      # 不是拆开的 DB_HOST/DB_PORT/DB_NAME——那三个变量后端根本不读。
+      # 库名用 stocklab（与 MYSQL_DATABASE、db-init 的目标库一致）。
+      DB_URL: jdbc:mysql://mysql:3306/stocklab?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true
+      DB_USERNAME: ${DB_USERNAME:-root}
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+
+      # Redis。后端用 Spring Boot 标准的 spring.data.redis 连接配置，
+      # 环境变量名是 SPRING_DATA_REDIS_*（relaxed binding），不是 REDIS_HOST/REDIS_PORT。
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      # 让 Redis 容器真正被用上：会话吊销与限流都切到 Redis（多实例共享语义）。
+      # 否则默认 memory store，Redis 容器白起。
+      SESSION_STORE: redis
+      RATE_LIMIT_STORE: redis
+
+      # 必须显式设置：application.yml 读的是 APP_JWT_SECRET（不是 JWT_SECRET），
+      # 缺失时应用会在启动阶段直接失败（@Size(min=32) 快速失败，这是有意的）
+      APP_JWT_SECRET: ${JWT_SECRET:?必须在环境变量或 deploy/.env 中设置 JWT_SECRET（至少 32 字符）}
+
+      # 可选。不配置时 AI 分析会降级为规则引擎，并在响应里如实标注
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+
+      # 容器内不用 H2 控制台
+      SPRING_H2_CONSOLE_ENABLED: "false"
+    ports:
+      # 宿主端口默认 18080 → 容器 8080。
+      # 不用 8080 的原因：Docker Desktop(WSL2) 自身会占用宿主 8080（wslrelay /
+      # com.docker.backend 进程），直接映射会报 "port is already allocated"。
+      # 前端 nginx 反代走容器内部网络 backend:8080，不经过这里，改宿主端口无影响。
+      - "${BACKEND_PORT:-18080}:8080"
+    networks: [stocklab]
+
+  frontend:
+    build:
+      context: ../frontend
+    container_name: stocklab-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      # 宿主端口默认 8088 → 容器 80，避免与常见的 80 端口占用冲突
+      - "${FRONTEND_PORT:-8088}:80"
+    networks: [stocklab]
+
+volumes:
+  mysql-data:
+  redis-data:
+
+networks:
+  stocklab:
+    driver: bridge

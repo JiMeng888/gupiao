@@ -1,0 +1,66 @@
+# ============================================================================
+# mysql profile：MySQL 8
+#
+# 前置步骤：
+#   1. 建库（字符集必须是 utf8mb4，否则股票名称与资讯标题里的生僻字会报错）：
+#        CREATE DATABASE stock_analyst
+#          DEFAULT CHARACTER SET utf8mb4
+#          DEFAULT COLLATE utf8mb4_0900_ai_ci;
+#   2. 建表：mysql -u<user> -p stock_analyst < src/main/resources/db/schema-mysql.sql
+#      （应用启动时不会自动执行 DDL：生产库不该让应用持有 DDL 权限）
+#   3. 设置环境变量后启动：
+#        SPRING_PROFILES_ACTIVE=mysql
+#        DB_URL=jdbc:mysql://localhost:3306/stock_analyst?...
+#        DB_USERNAME=...
+#        DB_PASSWORD=...
+#        APP_JWT_SECRET=<至少 32 字符的随机串>
+# ============================================================================
+
+spring:
+  datasource:
+    # rewriteBatchedStatements=true：开启批量插入的语句合并，写入吞吐提升明显
+    # serverTimezone=Asia/Shanghai：显式声明，避免驱动按 JVM 默认时区解释时间
+    # useSSL=false：本地/内网环境下的常见设置；跨公网请改为 true 并配置证书校验
+    url: ${DB_URL:jdbc:mysql://localhost:3306/stock_analyst?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:}
+
+    hikari:
+      # 连接池上限。经验值：CPU 核数 × 2 + 磁盘数；超过后吞吐不再提升，
+      # 反而因为上下文切换与锁竞争下降。MySQL 的 max_connections 也要留出余量
+      maximum-pool-size: 20
+      minimum-idle: 5
+      # 连接最大存活时间必须小于 MySQL 的 wait_timeout（默认 8 小时），
+      # 否则会拿到已被服务端关掉的连接，表现为偶发「Communications link failure」
+      max-lifetime: 1_700_000
+      connection-timeout: 5_000
+      # 只读事务的自动提交开关：交给 Spring 的 @Transactional(readOnly) 处理
+      auto-commit: true
+
+  sql:
+    init:
+      # 关键：不自动执行建表脚本。生产环境的表结构变更应由迁移工具
+      # （Flyway / Liquibase）或人工审阅后执行，不能让应用启动顺手改结构
+      mode: never
+
+# MySQL 下关闭 H2 控制台（dev profile 里的配置不会生效，这里显式声明意图）
+  h2:
+    console:
+      enabled: false
+
+mybatis-plus:
+  global-config:
+    banner: false
+    db-config:
+      id-type: assign_uuid
+
+management:
+  endpoint:
+    health:
+      # 生产环境只给聚合状态，不暴露数据库连接串等细节
+      show-details: never
+
+logging:
+  level:
+    com.stocklab.analyst: INFO

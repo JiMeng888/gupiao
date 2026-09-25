@@ -91,7 +91,14 @@ export interface BarsQuery {
 export const quoteApi = {
   indices: () => api.get<IndexSnapshot[]>('/quote/indices'),
 
-  carousel: (count = 6) => api.get<CarouselItem[]>('/quote/carousel', { count }),
+  /**
+   * 首页精选关注。
+   *
+   * `round` 是「第几批」而不是翻页页码：同一轮次后端返回结果稳定，
+   * 前端每 10 秒把它 +1 即可换一批。不要传时间戳——那样每个客户端
+   * 每次请求拿到的都是新组合，既无法复现也会让后端失去可缓存性。
+   */
+  carousel: (count = 6, round = 0) => api.get<CarouselItem[]>('/quote/carousel', { count, round }),
 
   search: (q: string) => api.get<StockBrief[]>('/quote/search', { q }),
 

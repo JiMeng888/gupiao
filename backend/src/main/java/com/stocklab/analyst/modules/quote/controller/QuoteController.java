@@ -60,13 +60,17 @@ public class QuoteController {
 
     @GetMapping("/carousel")
     @RateLimit(RateLimitScope.LOOSE)
-    @Operation(summary = "首页轮播精选", description = "同一天内结果稳定，跨天轮换")
+    @Operation(summary = "首页精选关注", description = "按 round 轮次返回一批精选股；同一轮次结果稳定，跨天轮换")
     public ApiResult<List<CarouselItem>> carousel(
             @RequestParam(defaultValue = "6")
             @Min(value = 1, message = "count 至少为 1")
             @Max(value = 8, message = "count 最多为 8")
-            int count) {
-        return ApiResult.ok(quoteService.getCarousel(count));
+            int count,
+            @RequestParam(defaultValue = "0")
+            @Min(value = 0, message = "round 不能为负")
+            @Max(value = 100000, message = "round 过大")
+            int round) {
+        return ApiResult.ok(quoteService.getCarousel(count, round));
     }
 
     @GetMapping("/search")

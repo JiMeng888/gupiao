@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>端到端联调验证报告 · 2026-09-23</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #1f2329; line-height: 1.6; padding: 32px 20px;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header {
+    background: linear-gradient(135deg, #2b5876, #4e4376);
+    color: #fff; border-radius: 12px; padding: 28px 32px; margin-bottom: 24px;
+  }
+  header h1 { font-size: 22px; font-weight: 600; margin-bottom: 6px; }
+  header .sub { font-size: 13px; opacity: .82; }
+  .verdict {
+    display: inline-block; margin-top: 14px; padding: 6px 16px;
+    background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.3);
+    border-radius: 20px; font-size: 13px;
+  }
+  .card {
+    background: #fff; border-radius: 10px; padding: 22px 24px; margin-bottom: 18px;
+    border: 1px solid #e5e6eb;
+  }
+  .card h2 {
+    font-size: 15px; font-weight: 600; margin-bottom: 16px;
+    padding-left: 10px; border-left: 3px solid #2b5876;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #eff0f2; }
+  th { background: #fafbfc; font-weight: 600; color: #4e5969; font-size: 12.5px; }
+  tr:last-child td { border-bottom: none; }
+  code {
+    background: #f2f3f5; padding: 2px 6px; border-radius: 4px;
+    font-family: "SF Mono", Consolas, Monaco, monospace; font-size: 12.5px;
+    color: #c7254e;
+  }
+  .ok   { color: #0a9e5c; font-weight: 600; }
+  .bad  { color: #d92b2b; font-weight: 600; }
+  .warn { color: #d97706; font-weight: 600; }
+  .tag {
+    display: inline-block; padding: 1px 8px; border-radius: 4px;
+    font-size: 11.5px; font-weight: 600; line-height: 18px;
+  }
+  .tag-ok   { background: #e8f7f0; color: #0a9e5c; }
+  .tag-bad  { background: #fdecec; color: #d92b2b; }
+  .tag-info { background: #eef2fb; color: #2b5876; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { background: #fafbfc; border: 1px solid #eff0f2; border-radius: 8px; padding: 14px 16px; }
+  .stat .n { font-size: 22px; font-weight: 700; color: #2b5876; line-height: 1.2; }
+  .stat .n.green { color: #0a9e5c; }
+  .stat .n.red { color: #d92b2b; }
+  .stat .l { font-size: 12px; color: #86909c; margin-top: 4px; }
+  .issue {
+    border-left: 3px solid #d92b2b; background: #fefafa;
+    padding: 14px 18px; border-radius: 0 8px 8px 0; margin-bottom: 14px;
+  }
+  .issue h3 { font-size: 14px; font-weight: 600; margin-bottom: 8px; color: #b91c1c; }
+  .issue p { font-size: 13px; color: #4e5969; margin-bottom: 6px; }
+  .issue p:last-child { margin-bottom: 0; }
+  .prog { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 13px; }
+  .bar { flex: 1; height: 8px; background: #eff0f2; border-radius: 4px; overflow: hidden; }
+  .bar span { display: block; height: 100%; border-radius: 4px; }
+  .note {
+    background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
+    padding: 14px 18px; font-size: 13px; color: #92400e; margin-top: 16px;
+  }
+  footer { text-align: center; font-size: 12px; color: #86909c; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>端到端联调验证报告</h1>
+    <div class="sub">股票分析师系统 · A股行情分析平台 &nbsp;|&nbsp; 2026-09-23 11:30 &nbsp;|&nbsp; 环境：JDK 21.0.12.1 + Maven 3.9.11</div>
+    <div class="verdict">✅ 核心目标全部达成 · 发现 3 个既存问题待决策</div>
+  </header>
+
+  <div class="card">
+    <h2>一、验证结果总览</h2>
+    <div class="grid">
+      <div class="stat"><div class="n green">324</div><div class="l">单元测试通过 / 0 失败</div></div>
+      <div class="stat"><div class="n green">0</div><div class="l">前端类型检查错误</div></div>
+      <div class="stat"><div class="n green">1.60s</div><div class="l">前端构建耗时</div></div>
+      <div class="stat"><div class="n green">30</div><div class="l">美股频道返回条数</div></div>
+      <div class="stat"><div class="n green">9.4′</div><div class="l">最新资讯时效</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>二、验证明细</h2>
+    <table>
+      <thead>
+        <tr><th style="width:130px">项目</th><th>方式</th><th style="width:220px">结果</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>后端测试</td>
+          <td><code>mvn test</code></td>
+          <td><span class="tag tag-ok">通过</span> 324 / 0 失败 / 19 跳过</td>
+        </tr>
+        <tr>
+          <td>后端编译</td>
+          <td><code>mvn -DskipTests compile</code></td>
+          <td><span class="tag tag-ok">通过</span> 120 文件 · release 21</td>
+        </tr>
+        <tr>
+          <td>前端类型检查</td>
+          <td><code>vue-tsc --noEmit</code></td>
+          <td><span class="tag tag-ok">通过</span> 0 错误</td>
+        </tr>
+        <tr>
+          <td>前端构建</td>
+          <td><code>vite build</code></td>
+          <td><span class="tag tag-ok">通过</span> built in 1.60s</td>
+        </tr>
+        <tr>
+          <td>健康检查</td>
+          <td><code>GET /actuator/health</code></td>
+          <td><span class="tag tag-ok">UP</span></td>
+        </tr>
+        <tr>
+          <td><strong>美股频道</strong></td>
+          <td><code>GET /news/list?channel=us</code></td>
+          <td><span class="tag tag-ok">已修复</span> 30 条实时 · 字段 0 缺失</td>
+        </tr>
+        <tr>
+          <td>首页四区块</td>
+          <td>无头 Chrome 抓取 DOM</td>
+          <td><span class="tag tag-ok">正常</span> 5 / 6 / 8 / 10 条</td>
+        </tr>
+        <tr>
+          <td>自动轮播推进</td>
+          <td>两时刻截图对比</td>
+          <td><span class="tag tag-ok">正常</span> 四区块全部推进</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>三、美股频道修复确认</h2>
+    <p style="font-size:13.5px;color:#4e5969;margin-bottom:14px">
+      改动是将 <code>pageid</code> 从 URL 硬编码提升为频道级配置，并把美股切到
+      <code>384/2672</code>。以下为真实接口返回：
+    </p>
+    <table>
+      <thead>
+        <tr><th style="width:90px">时间</th><th>标题</th><th style="width:110px">来源</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>09-23 11:17</td><td>软银启动逾110亿美元的高收益债发行 为AI领域扩张筹资</td><td>环球市场播报</td></tr>
+        <tr><td>09-23 10:59</td><td>软银正接受总额100亿美元债券的认购，以筹集对OpenAI的投资资金</td><td>环球市场播报</td></tr>
+        <tr><td>09-23 10:52</td><td>Anthropic据悉考虑租用最高1吉瓦的数据中心容量</td><td>环球市场播报</td></tr>
+        <tr><td>09-23 10:32</td><td>期权交易员押注韩元领先亚币的涨势还将更进一步</td><td>环球市场播报</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <strong>关键证据：</strong>全部 30 条的 <code>url</code> 均含 <code>/stock/usstock/</code>，
+      最新一条距今仅 <strong>9.4 分钟</strong>，<code>timeText</code> / <code>source</code> / <code>ctime</code>
+      等字段 <strong>0 缺失</strong>。修复确认有效。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>四、自动轮播推进证据</h2>
+    <table>
+      <thead>
+        <tr><th style="width:130px">区块</th><th>t ≈ 3s</th><th>t ≈ 12s</th><th style="width:70px">位移</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>大盘指数</td><td>上证指数（第 1 点）</td><td>创业板指（第 3 点）</td><td class="ok">✓</td></tr>
+        <tr><td>精选关注</td><td>伊利股份（第 1 点）</td><td>贵州茅台（第 3 点）</td><td class="ok">✓</td></tr>
+        <tr><td>最新资讯</td><td>影视行业回款乱象</td><td>光纤概念股早盘走高</td><td class="ok">✓</td></tr>
+        <tr><td>今日涨幅榜</td><td>中芯国际 · 第 1 名</td><td>贵州茅台 · 第 3 名</td><td class="ok">✓</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>五、发现的问题（均非本次改造引入，待决策）</h2>
+
+    <div class="issue">
+      <h3>问题 1 · <code>all</code> 聚合被两个频道垄断，后三个频道永远进不来</h3>
+      <p>实测 <code>all</code> 的频道分布，在多个 <code>limit</code> 下结论一致：</p>
+      <div class="prog"><span style="width:60px">limit 8</span><div class="bar"><span style="width:62.5%;background:#2b5876"></span><span style="width:37.5%;background:#7ba7c9"></span></div><span style="width:130px;font-size:12px">财经5 · A股3</span></div>
+      <div class="prog"><span style="width:60px">limit 20</span><div class="bar"><span style="width:65%;background:#2b5876"></span><span style="width:35%;background:#7ba7c9"></span></div><span style="width:130px;font-size:12px">财经13 · A股7</span></div>
+      <div class="prog"><span style="width:60px">limit 30</span><div class="bar"><span style="width:60%;background:#2b5876"></span><span style="width:40%;background:#7ba7c9"></span></div><span style="width:130px;font-size:12px">财经18 · A股12</span></div>
+      <p style="margin-top:10px"><strong>港股 / 美股 / 全球市场 0 条。</strong>
+        原因：<code>NewsService.aggregate</code> 拉取全部频道后按 <code>ctime</code> 倒序取前 N 条，
+        而 <code>finance</code> 与 <code>a-shares</code> 更新更频繁，把名额占满——
+        30 条的截断线是 <code>10:14</code>，而 <code>hk</code>/<code>us</code> 只覆盖到 <code>07:45</code>，全部被挤出。</p>
+      <p><strong>建议：</strong>聚合改为「按频道配额轮询」而非「全局时间排序」，或提高预取量后按比例取样。</p>
+    </div>
+
+    <div class="issue">
+      <h3>问题 2 · <code>global</code> 频道内容停更 3.4 年 + 涉政风险</h3>
+      <table style="margin-top:8px">
+        <thead><tr><th style="width:140px">频道</th><th style="width:150px">最新一条</th><th>内容性质</th></tr></thead>
+        <tbody>
+          <tr><td>global · <code>153/2514</code></td><td class="bad">2023-05-10</td><td>观察者网 / 环球网国际时政（北约、台海、中日）</td></tr>
+        </tbody>
+      </table>
+      <p style="margin-top:10px">比此前判断更严重——不只是内容与标签不符，而是<strong>整个栏目早已停更</strong>，
+        同时仍会向首页推送涉台海、涉北约标题，存在合规风险。<strong>建议下架该频道。</strong></p>
+    </div>
+
+    <div class="issue">
+      <h3>问题 3 · <code>hk</code> 与 <code>us</code> 是同一个栏目</h3>
+      <p>两频道时间范围<strong>完全一致</strong>（<code>11:17:46 ~ 07:45:57</code>），首条标题完全相同。
+        即 <code>153/2518</code> 与 <code>384/2672</code> 指向同一份内容，只是新浪提供了两个入口。
+        首页若同时展示会出现重复条目（当前因问题 1 而未暴露）。</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>六、一次目测误判的纠正</h2>
+    <p style="font-size:13.5px;color:#4e5969;margin-bottom:12px">
+      窄屏（969px）截图看起来「轮播卡片内容几乎全不可见、只剩右侧一个碎片」，
+      一度判断为轮播的响应式缺陷。<strong>DOM 量测证明是假象：</strong>
+    </p>
+    <table>
+      <tbody>
+        <tr><td style="width:260px">轮播项内容溢出检查</td><td><span class="tag tag-ok">29/29 全部未溢出</span></td></tr>
+        <tr><td>轮播容器宽度</td><td>903px / 426.5px，与视口匹配 ✓</td></tr>
+        <tr><td><code>el-carousel__item</code> 的 minWidth</td><td>0px ✓</td></tr>
+        <tr><td>截图里看到的</td><td>是 <code>translateX</code> 过渡<strong>中间态</strong>被渲染了出来</td></tr>
+        <tr><td><strong>真正撑宽页面的元凶</strong></td><td class="bad"><code>.layout__actions</code>（导航栏操作区，DefaultLayout.vue:237）</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <strong>根因：</strong><code>.layout__actions</code> 是 <code>display:flex</code>，
+      内含固定 <code>width:240px</code> 搜索框 + 状态标签 + 登录按钮，
+      <strong>无任何收缩策略</strong>（缺 <code>flex-shrink</code> / <code>min-width:0</code> / <code>flex-wrap</code>）。
+      在 969px 视口下其右边界达 1081px，导致 <code>document.scrollWidth = 1081 &gt; clientWidth = 969</code>，整页横向滚动。
+      <br><br>
+      <strong>这是导航栏的既有问题，与轮播改造无关。</strong>
+      <br><br>
+      教训（同类错误第二次）：<strong>窄屏或像素级布局问题一律先做 DOM 量测并设对照组，不要用截图目测下结论。</strong>
+    </div>
+  </div>
+
+  <footer>
+    本报告仅供技术验证参考，不构成任何投资建议。股市有风险，投资需谨慎。
+  </footer>
+
+</div>
+</body>
+</html>

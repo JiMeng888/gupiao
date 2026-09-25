@@ -100,12 +100,13 @@ gupiao/
 │   │       ├── holding/         持仓与盈亏
 │   │       ├── news/            资讯
 │   │       └── analysis/        AI 研判（大模型 + 规则引擎降级）
+│   │           └── support/     分析协作者：取数 / 提示词 / 解析 / 兜底报告 / 存档（见 §6.12）
 │   ├── src/main/resources/
 │   │   ├── application.yml      主配置（敏感项全走环境变量）
 │   │   ├── application-dev.yml  H2 内存库
 │   │   ├── application-mysql.yml MySQL 8
-│   │   └── db/                  schema-h2.sql / schema-mysql.sql
-│   ├── src/test/java/.../       单元测试（297 项，见 5.1）
+│   │   └── db/migration/        Flyway 迁移脚本：{mysql,h2}/V1__baseline.sql
+│   ├── src/test/java/.../       单元测试（373 项 / 20 个类，见 5.1）
 │   ├── scripts/
 │   │   ├── smoke-test.sh        冒烟测试（54 项断言，见第五节）
 │   │   └── ws-check.mjs         WebSocket 协议验证脚本
@@ -118,7 +119,8 @@ gupiao/
 │   │   ├── layouts/             DefaultLayout
 │   │   └── views/               9 个页面
 │   ├── nginx.conf               生产静态托管 + 反向代理
-│   └── Dockerfile
+│   ├── Dockerfile               多阶段：node 构建 → nginx 托管
+│   └── .dockerignore            排除 node_modules/dist（**必须有**，原因见 §3.4）
 ├── deploy/                      一键起全栈：docker-compose.yml + .env.example + start/stop 脚本（**需在此目录下执行**）
 ├── docs/screenshots/            浏览器实测截图（见 5.4）
 ├── .github/workflows/ci.yml     三条流水线：单测 / 前端构建 / 冒烟+WS（未在 Actions 上跑过）
@@ -132,7 +134,7 @@ gupiao/
 ### 3.1 后端（开发环境，H2 内存库，无需装数据库）
 
 ```bash
-# 跑单元测试（324 项，不需要数据库，不占端口）
+# 跑单元测试（373 项，不需要数据库，不占端口）
 # 其中 19 项需要真 Redis，未提供时会逐条标记为跳过（Skipped: 19），不算失败
 bash tools/mvn.sh -f backend/pom.xml -o test
 
@@ -164,11 +166,20 @@ export DB_USERNAME=stockapp DB_PASSWORD='...'
 export JWT_SECRET='至少 32 字符的随机串'   # 该变量没有默认值，缺失会启动失败
 export LLM_API_KEY='...'                  # 可选，不配则 AI 分析降级为规则引擎
 
-# 先建表（schema-mysql.sql 用的是 CREATE TABLE IF NOT EXISTS，可重复执行）
-mysql -h localhost -u root -p stocklab < backend/src/main/resources/db/schema-mysql.sql
-
+# 不需要手工建表：启动时由 Flyway 执行 db/migration/mysql/ 下的迁移脚本。
+#   - 全新库      → 执行 V1__baseline.sql 建表
+#   - 已有表的库  → baseline-on-migrate 打基线跳过 V1，**数据原样保留**
+# 应用账号需要 DDL 权限（Flyway 要建 flyway_schema_history）；不允许时用
+# spring.flyway.user / spring.flyway.password 指定独立迁移账号。
 java -jar backend/target/stock-analyst-backend.jar --spring.profiles.active=mysql
 ```
+
+> **为什么不再有 `schema-mysql.sql`**：原来「手工执行建表脚本」与「迁移工具」
+> 两套机制并存时，建表脚本会把表先建出来、Flyway 只看到「结构非空」而打基线，
+> 结果是**谁都没有真正管过结构演进**——这正是引入迁移工具要消灭的状态。
+> 现在 DDL 的唯一归属是 `db/migration/`，`deploy/docker-compose.yml` 里那个
+> 一次性的 `db-init` 容器也已一并移除。旧的 `schema-*.sql` 内容原样变成了
+> `V1__baseline.sql`（`IF NOT EXISTS` 语句逐字节保留，以保证与既有表结构一致）。
 
 ### 3.3 前端
 
@@ -179,10 +190,14 @@ npm install
 # 开发模式：http://localhost:5173，/api 与 /ws 自动代理到 :8080
 npm run dev
 
-# 类型检查（vue-tsc 查 src，tsc 查 vite.config.ts）
+# 单元测试（Vitest + jsdom）
+npm run test          # 跑一遍退出
+npm run test:watch    # 监听模式
+
+# 类型检查（vue-tsc 查 src，tsc 查 vite.config.ts / vitest.config.ts）
 npm run typecheck
 
-# 生产构建 → dist/
+# 生产构建 → dist/（先 typecheck 再 vite build）
 npm run build
 
 # 预览生产构建产物（同样带 /api 与 /ws 代理，用于联调）
@@ -216,7 +231,7 @@ npm run preview       # http://localhost:4173
 
 > ⚠️ **不要用 `cp .env.example .env` 直接覆盖已有的 `.env`**。`.env.example` 里密钥是空值/占位符，
 > 覆盖后会导致 `JWT_SECRET is missing`，且一旦 MySQL 容器已用旧密码初始化过，还会引发「密码分裂」
-> （`db-init` 报 `ERROR 1045`）。要生成带随机密钥的 `.env`，请用 `init-env.bat`/`init-env.ps1`。
+> （后端连库报 `Access denied for user 'root'@'...'`）。要生成带随机密钥的 `.env`，请用 `init-env.bat`/`init-env.ps1`。
 
 ```bash
 cd deploy
@@ -251,9 +266,65 @@ docker compose -f deploy/docker-compose.yml up -d --build
 | `Bind for 0.0.0.0:3306 failed: port is already allocated` | 本机已有 MySQL 占用 3306 | 已改用宿主 3307（`.env` 里 `MYSQL_PORT` 可改） |
 | `Bind for 0.0.0.0:8080 failed: port is already allocated` | Docker Desktop(WSL2) 自身占用宿主 8080 | 已改用宿主 18080（`.env` 里 `BACKEND_PORT` 可改） |
 | `Unsupported character encoding 'utf8mb4'` | JDBC URL 里 `characterEncoding` 用了 MySQL 字符集名 | 已改为 `characterEncoding=UTF-8`（Java 字符集名） |
-| `db-init` 报 `Can't connect to MySQL (111)` | MySQL 8 镜像首次启动先起临时 server 初始化，healthcheck 过早放行 | db-init 已加退避重试循环 |
-| `db-init` 报 `ERROR 1045 Access denied (using password: YES)` | **MySQL 密码分裂**：`.env` 的 `MYSQL_ROOT_PASSWORD` 被改过（如手动 `cp .env.example .env` 覆盖），但 MySQL 数据卷里还是旧密码 | 删数据卷重建：`docker compose down && docker volume rm deploy_mysql-data && docker compose up -d`（会清空库，仅测试数据时安全） |
+| 后端启动报 `Can't connect to MySQL (111)` | MySQL 8 镜像首次启动先起临时 server 初始化，healthcheck 过早放行 | compose 已用 `depends_on: service_healthy` 规避；偶发时等 MySQL healthy 后 `docker compose restart backend` |
+| 后端启动报 `Access denied for user 'root'@'...'` | **MySQL 密码分裂**：`.env` 的 `MYSQL_ROOT_PASSWORD` 被改过（如手动 `cp .env.example .env` 覆盖），但 MySQL 数据卷里还是旧密码 | 删数据卷重建：`docker compose down && docker volume rm deploy_mysql-data && docker compose up -d`（会清空库，仅测试数据时安全） |
+| 页面样式正常但体积没变化 / 改了前端却看不到效果 | **部署镜像是旧的**：`docker compose up -d --build` 只重建镜像，**不会自动在你改代码后重跑**；用 `--build` 漏掉或改了代码没重建都会如此 | 先 `cd deploy && docker compose up -d --build`，再按下面的「怎么确认部署真的是最新」核对产物字节数 |
 | 构建卡在 `mvn dependency:go-offline` 或 `npm ci` | 首次拉依赖，受网络影响 | 属正常首次构建耗时；耐心等待，或配置镜像加速 |
+
+#### 怎么确认「部署的真的是最新构建」（别只看镜像时间）
+
+**判定依据是产物字节数 / 哈希，不是镜像构建时间。** 这一条是踩过坑才写下的：
+镜像"看起来刚构建过"（`docker images` 显示 `26 minutes ago`），但里面装的仍是
+改造前的产物 —— 因为那次重建发生在源码改动**之前**（为另一处改动而跑）。
+
+```bash
+# ① 本地刚构建出的产物
+cd frontend && npm run build
+ls -l dist/assets | grep -E 'element|echarts'
+
+# ② 部署容器里的产物
+docker exec stocklab-frontend ls -l /usr/share/nginx/html/assets | grep -E 'element|echarts'
+
+# ③ 8088 实际返回的字节数（最终以这条为准）
+curl -s http://localhost:8088/ | grep -o '/assets/[A-Za-z0-9_-]*\.\(js\|css\)'
+curl -sI http://localhost:8088/assets/element-XXXX.js | grep -i content-length
+```
+
+三者必须一致。以本轮改造后的实测值为基准：
+
+| 产物 | 改造前 | 改造后（当前应为这个） |
+|---|---|---|
+| `element-*.js` | 985,775 B | **591,615 B** |
+| `element-*.css` | 359,988 B | **201,513 B** |
+| `echarts-*.js` | 1,117,148 B | **579,243 B** |
+
+**两个容易误判的地方**：
+
+1. **时区**：`docker images` 的 `CreatedSince` 是本地时区，而 `docker inspect` 的
+   `.Created` 是 UTC。拿源码 mtime 去比时**先统一时区**——本项目用 `toISOString()`
+   读出的源码时间是 UTC，曾因此把「改动晚于镜像」误判成「改动早于镜像」。
+2. **容器用的是不是最新镜像**：`docker ps` 只显示 tag 名，比不出来。要比 ID：
+
+   ```bash
+   docker inspect stocklab-frontend --format '{{.Image}}'
+   docker inspect deploy-frontend:latest --format '{{.Id}}'
+   ```
+
+   两者相等，才是真的用上了刚构建的镜像。
+
+#### 为什么 `frontend/.dockerignore` 不能删
+
+`frontend/Dockerfile` 第一阶段是 `COPY package.json package-lock.json* ./` + `npm ci`，
+之后 `COPY . .`。**没有 `.dockerignore` 时，第二条 COPY 会把宿主机的 `node_modules`
+整个盖到容器里刚装好的依赖树之上**：
+
+- 宿主机（Windows / macOS）装的 esbuild / rolldown 原生二进制属于 `win32-x64` /
+  `darwin-arm64`，与容器内的 `linux-x64` 版本并存——现在能跑对只是因为 Node 按
+  `process.platform` 解析，属于"碰巧没事"，不是有保证的行为；
+- 更实质的风险是 **`npm ci` 的「按锁文件精确还原」被架空**：COPY 会覆盖同名文件，
+  宿主机 `node_modules` 若与 `package-lock.json` 不同步，构建就用宿主机那一份。
+
+`backend/Dockerfile` 用的是 `COPY src ./src`（显式指定目录），不受此影响，因此后端不需要。
 
 ---
 
@@ -362,11 +433,12 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 | 项 | 复跑命令 | 实测结果 |
 |---|---|---|
-| 后端单元测试 | `bash tools/mvn.sh -f backend/pom.xml -o test` | **297 项**：实跑 **278 项全通过** + **19 项跳过**（本机无 Redis），0 失败 / 0 错误，`BUILD SUCCESS` |
+| 后端单元测试 | `bash tools/mvn.sh -f backend/pom.xml -o test` | **373 项**：实跑 **354 项全通过** + **19 项跳过**（本机无 Redis），0 失败 / 0 错误，`BUILD SUCCESS` |
 | 后端接口冒烟 | `BASE=http://localhost:18080 bash backend/scripts/smoke-test.sh` | **54 项断言全通过**，退出码 0（含市场榜单 4 条新断言）；榜单功能实装后重新打包实跑过 |
 | WebSocket 协议 | `node backend/scripts/ws-check.mjs ws://localhost:8080/ws/quote` | **12 项断言全通过** |
+| 前端单元测试 | `cd frontend && npm run test` | **7 项全通过**（`marketSource` store：不可达 / 降级 / 未就绪 / 正常四态 + 恢复后清除） |
 | 前端类型检查 | `cd frontend && npm run typecheck` | **0 错误**（`vue-tsc` + `tsc` 两份配置各查一遍） |
-| 前端生产构建 | `cd frontend && npm run build` | **2292 个模块，4.89s**，产出 `dist/` |
+| 前端生产构建 | `cd frontend && npm run build` | **2386 个模块**，产出 `dist/`；体积对比见 §5.4 |
 | 前后端联调 | 见 5.4 | 静态托管 / SPA 回退 / `/api` 代理 / `/ws` 代理 全部实测通过 |
 | 浏览器端到端 | 见 5.4 | 5 个页面 + 注册登录链路实测，**JS 运行时错误 0** |
 | CI 流水线 | `.github/workflows/ci.yml` | 三个 job 已配置（`backend-unit` / `frontend-build` / `integration`），两个带 `services.redis`，含 **3 处防「假绿」守卫**；**未在真实 GitHub Runner 上跑过**（本机无 Actions 环境） |
@@ -389,23 +461,34 @@ docker compose -f deploy/docker-compose.yml up -d --build
 自选股（懒创建分组/重复/非法代码）、持仓（买入/补仓加权成本=1250/卖出/超量卖出/汇总）、
 AI 分析（降级标注/存档命中/历史/非法代码）、WS 统计。
 
-#### 单元测试明细（297 项）
+#### 单元测试明细（400 项）
 
 JUnit 5 + AssertJ + Mockito，`spring-boot-starter-test` 已含，全部为 test scope，不引额外依赖。
 
+> **下表的项数取自 Surefire 报告实测**（数 `<testcase>` 元素，不读 `<testsuite tests>` 属性——
+> 同一个结果集后者会少算，见 §5.3.1 ①）。此前有两行的项数是过时的，已按实测修正；
+> `QuoteServiceTest` 更是从来没被列进来过。
+
 | 测试类 | 项数 | 分布（`@Nested`） |
 |---|---|---|
+| `ResilientMarketDataProviderTest` | 51 | 主数据源正常、降级、查无此股、关闭降级、市场榜单、与真实演示源协作、对外元信息、多级降级链与冷却、**拒绝编造降级数据**（本轮新增 6 项，见 §6.12） |
 | `WatchlistServiceTest` | 50 | 分组列表与懒创建 10、列出条目 11、添加条目 13、创建分组 7、删除分组 4、删除条目 4、常量契约 1 |
 | `AuthServiceTest` | 39 | 注册 7、登录 6、刷新令牌 9、登出 8、当前用户 2、修改密码 5、日志脱敏 2 |
-| `ResilientMarketDataProviderTest` | 46 | 主数据源正常 7、降级 8、查无此股 6、关闭降级 5、市场榜单 3、与真实演示源协作 2、对外元信息 4、多级降级链与冷却 11 |
-| `TencentMarketDataProviderParseTest` | 13 | 实时报价 5、日/周/月 K 线 4、分时 3、指数 2（样本均为 2026-09-21 真实上游响应） |
 | `IndicatorCalculatorTest` | 32 | ma 简单移动平均 4、ema 3、sma 通达信口径 2、macd 3、boll 6、kdj 5、rsi 6、toList 3 |
 | `RedisTokenBucketRateLimiterTest` | 25 | 发给 Redis 的参数 6、键设计 4、脚本返回值解析 12、Redis 故障 3 |
 | `HoldingServiceTest` | 25 | 买入与补仓 9、查询与组合总览 5、卖出 5、并发首次买入 2、删除持仓 2、名称解析 2 |
 | `RedisTokenRevocationStoreTest` | 19 | 键与 TTL 5、不该写入的情况 3、查询 6、Redis 故障 5 |
 | `RateLimitAspectTest` | 18 | 切入点织入 4、放行与拦截 6、客户端标识解析 8 |
 | `InMemoryTokenBucketRateLimiterTest` | 17 | 容量与拒绝 3、隔离 3、补充 2、并发 2、回收空闲桶 2、stats 1、配置默认值 4 |
+| `TencentMarketDataProviderParseTest` | 15 | 实时报价、日/周/月 K 线、分时、指数（样本均为真实上游响应） |
+| `LlmJsonParserTest` | 12 | 三级降级解析 6、围栏剥离 2、字段读取 4（**本轮新增**） |
 | `RedisTokenBucketRateLimiterRedisTest` ⚑ | 11 | 令牌扣减 4、多实例共享配额 2、键隔离与回收 4、令牌补充 1 |
+| `PromptBuilderTest` | 11 | 数据齐全 4、数据缺失 3、数据可信度 4（**本轮新增**） |
+| `RuleBasedReportGeneratorTest` | 11 | 数据可信度约束 3、缺数时的措辞 3、由数据推导的结论 2、元信息 3（**本轮新增**） |
+| `AnalysisServiceOrchestrationTest` | 9 | 存档命中与强制刷新 3、校验与失败路径 4、大模型成功与历史 2（**本轮新增**，编排分支判定） |
+| `JwtTokenServiceTest` | 9 | 签发与解析往返 3、校验失败的错误码映射 5、构造期防线 1（**本轮新增**，能力边界） |
+| `AuthControllerValidationTest` | 9 | 注册校验 3、登录校验与防用户枚举 2、通用异常映射 4（**本轮新增**，standalone MockMvc 切片） |
+| `QuoteServiceTest` | 9 | 轮转切片：相邻批次零重合 7、空池兜底等 2（**只测轮播**——`QuoteService` 没有缓存层，见 §7.7） |
 | `AsyncConfigTest` | 8 | 基本参数 4、饱和时的行为 2、关闭语义 2 |
 | `RedisTokenRevocationStoreRedisTest` ⚑ | 8 | 跨实例可见性 4、过期 2、登出流程形状 2 |
 | `MockMarketDataProviderMoversTest` | 5 | 涨幅降序 1、跌幅升序 1、成交额榜 1、limit 收敛 1、条目身份 1 |
@@ -524,15 +607,15 @@ JUnit 5 + AssertJ + Mockito，`spring-boot-starter-test` 已含，全部为 test
 | 行情降级与错误分界 | ✅ | `ResilientMarketDataProviderTest` 32 项，含「查无此股绝不降级」6 项 |
 | 越权防护（自选股） | ✅ | `WatchlistServiceTest` 50 项，断言**真实 SQL 片段与参数**含 `user_id`；另做过变异验证（见下） |
 | 线程池语义 | ✅ | `AsyncConfigTest` 8 项：有界队列、`CallerRunsPolicy` 不丢任务、优雅停机等待 |
-| 异步扇出（分析取数三路并发） | ⚠️ | 代码已实现（3 × `CompletableFuture.supplyAsync` + 逐路兜底），**无单测** |
+| 异步扇出（分析取数三路并发） | ⚠️ | 代码已实现（3 × `CompletableFuture.supplyAsync` + 逐路兜底），已抽到 `AnalysisInputLoader`，但**仍无单测**（它是 Spring Bean，测它要搭三个依赖的替身；判据上它属于「坏了会报错」那一类，优先级低于纯逻辑） |
 | **异步 AI 生成** | ❌ | **明确未实现**：`AnalysisService#fromLlm` 在**请求线程上同步等待**至 `app.llm.timeout`（默认 45s），无任务队列、无 `taskId`、无回执。已把现状与改造落点写进类注释 |
 | **WS 鉴权** | ❌ | **有意不做**，且已论证：`/ws/quote` 只推公开行情，不涉及用户数据。改造方案（先调 REST 换一次性 ticket 再握手，避免把长效 token 放进 query）写在 `QuoteWebSocketHandler` 类注释里 |
-| MySQL profile | ⚠️ | 代码与 `schema-mysql.sql` 就绪，**未实跑建表与 profile 切换** |
-| Docker Compose | ✅ | **已实跑通过**（2026-09-21）。拉起 4 容器，后端健康 UP、连上 MySQL、前端可访问。实跑修复了变量名不一致（`JWT_SECRET`→`APP_JWT_SECRET`、`DB_URL`、`SPRING_DATA_REDIS_*`）、JDBC `characterEncoding=utf8mb4`→`UTF-8`、宿主端口冲突（3306/8080 被占→改 3307/18080）、db-init 时序竞态 4 类缺陷 |
+| MySQL profile | ✅ | **已实跑**（2026-09-24）。两条路径都验过：① 空库 → Flyway 执行 V1 建表，注册/登录/自选股可用；② **既有库升级 → `baseline-on-migrate` 打基线跳过 V1，`users`/`holdings`/`ai_reports`/`watchlist_groups` 行数与升级前逐条一致**（数据未丢），`flyway_schema_history` 记录 `type=BASELINE, success=1` |
+| Docker Compose | ✅ | **已实跑通过**（2026-09-21，2026-09-24 复跑）。拉起 4 容器，后端健康 UP、连上 MySQL、前端可访问。实跑修复了变量名不一致（`JWT_SECRET`→`APP_JWT_SECRET`、`DB_URL`、`SPRING_DATA_REDIS_*`）、JDBC `characterEncoding=utf8mb4`→`UTF-8`、宿主端口冲突（3306/8080 被占→改 3307/18080）、db-init 时序竞态 4 类缺陷。**2026-09-24 复跑发现并修掉两个部署缺陷**：前端缺 `.dockerignore` 导致宿主机 `node_modules` 覆盖容器依赖树；以及「改了代码没重建镜像 → 部署仍是旧产物」（判定方法与基准字节数见 §3.4） |
 | 真实大模型输出 | ⚠️ | 未配置 `LLM_API_KEY`，走规则引擎；**大模型调用链路未被真实验证** |
 | 真实行情链路 | ⚠️ | 上游 `push2` / `push2his` 本机不可达，报价与 K 线走降级数据源 |
 | CI | ⚠️ | 三个 job 已配置、YAML 结构经解析校验，**未在真实 GitHub Runner 上跑过** |
-| 前端交互路径 | ⚠️ | 类型检查 / 生产构建 / 浏览器 5 个页面实跑已验证，更复杂的交互路径未逐一覆盖 |
+| 前端交互路径 | ⚠️ | 类型检查 / 生产构建 / 浏览器 5 个页面实跑已验证；另有 7 项 Vitest 覆盖数据源状态 store。更复杂的交互路径未逐一覆盖 |
 
 #### 5.3.1 这套验证是怎么落到实处的
 
@@ -602,12 +685,43 @@ Tests run: 50, Failures: 8
 $ cd frontend && npm run build
 > vue-tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json
 > vite build
-✓ 2292 modules transformed.
-dist/assets/echarts-*.js    1,117.14 kB │ gzip: 370.60 kB
-dist/assets/element-*.js      985.75 kB │ gzip: 316.39 kB
-dist/assets/index-*.js         36.68 kB │ gzip:  14.72 kB
-✓ built in 4.89s
+✓ 2386 modules transformed.
+dist/assets/echarts-*.js       579.24 kB │ gzip: 194.94 kB
+dist/assets/element-*.js       591.61 kB │ gzip: 193.57 kB
+dist/assets/element-*.css      201.51 kB │ gzip:  26.82 kB
+dist/assets/index-*.js          37.71 kB │ gzip:  15.29 kB
+✓ built in 1.50s
 ```
+
+#### 按需引入前后对比（本轮改造，均为实测产物而非估算）
+
+| 产物 | 改造前 | 改造后 | 变化 |
+|---|---|---|---|
+| `echarts` chunk (JS) | 1,117.14 kB / gzip 370.60 kB | **579.24 kB / gzip 194.94 kB** | −175.7 kB gzip（−47%） |
+| `element` chunk (JS) | 985.77 kB / gzip 316.40 kB | **591.61 kB / gzip 193.57 kB** | −122.8 kB gzip（−39%） |
+| `element` chunk (CSS) | 359.98 kB / gzip 47.92 kB | **201.51 kB / gzip 26.82 kB** | −21.1 kB gzip（−44%） |
+| 合计 | 约 735 kB gzip | 约 415 kB gzip | **−320 kB gzip（−43%）** |
+
+改法与踩到的坑：
+
+- **ECharts**：`BaseChart.vue` 从 `import * as echarts from 'echarts'` 改为
+  `echarts/core` + 按需注册（`CandlestickChart` / `LineChart` / `BarChart` +
+  tooltip / legend / grid / dataZoom / axisPointer + `CanvasRenderer`）。
+  这份清单**必须与视图里的 option 一一对应，漏一个只会运行时报错**——
+  少注册 `GridComponent` 是整张图空白，少注册 `CandlestickChart` 才报
+  「Series candlestick is used but not imported」。已在 `BaseChart.vue` 注释里列出对应关系。
+- **Element Plus**：模板里的 `<el-xxx>` 交给 `unplugin-vue-components` 的
+  `ElementPlusResolver` 在编译期解析并连带引样式，因此去掉了
+  `app.use(ElementPlus)` 与 `element-plus/dist/index.css`。
+  两个必须补的地方：**函数式组件**（`ElMessage` / `ElMessageBox`）与**指令**（`v-loading`）
+  不是模板标签，解析器管不到，样式要在 `main.ts` 显式引三个 style 入口；
+  **语言包**要改用根组件的 `<el-config-provider :locale="zhCn">`，
+  否则分页、空态等内置文案会退回英文。
+- **没有引入 `unplugin-auto-import`**：它能省掉 `ElMessage` 的 import，
+  代价是这些符号变成来源不明的全局变量，反而降低可读性。函数式组件缺的只是样式，
+  显式引三个入口就够。装过又删了，`package.json` 里没有它。
+- **代价**：新增一个构建期插件依赖；`el-table-column` 插槽的 `row` 类型仍未被检查
+  （关掉 `dts` 的原因与实测过程写在 `vite.config.ts` 的注释里）。
 
 **前后端联调**（用 `vite preview` 预览生产构建 + 真实后端）：
 
@@ -658,16 +772,31 @@ dist/assets/index-*.js         36.68 kB │ gzip:  14.72 kB
 
 ## 六、本次修复的真实缺陷（不是设计设想）
 
-以下问题都是在实跑验证中发现并修掉的，值得单独记录。共 9 条，
-其中 5 条是功能性缺陷（登出假成功、数据源状态自相矛盾、预热只缓存 100 只、
-前端登录态被永久缓存、**登出只吊销一半**），2 条是文档与实现不一致（`dayPnl`、卖出语义），
-2 条是**测试自身不可靠**（限流打回 429、手机号没补零）。
+以下问题都是实跑验证、代码走查或部署复跑中发现并修掉的，值得单独记录。共 19 条。
 
-最后一类容易被当成"环境噪声"跳过，但它们比前面几条更值得修——
+**第 1~11 条来自实跑与写测试的过程**：其中 5 条是功能性缺陷（登出假成功、
+数据源状态自相矛盾、预热只缓存 100 只、前端登录态被永久缓存、**登出只吊销一半**），
+2 条是文档与实现不一致（`dayPnl`、卖出语义），2 条是**测试自身不可靠**
+（限流打回 429、手机号没补零）。
+
+**第 12~17 条来自一轮代码走查**（`docs/优化建议-代码走查-20260922.md`），
+不是跑出来的，按 P0 → P2 的顺序逐条修复。
+
+**第 18 条来自部署复跑**，与业务代码无关，属构建 / 交付链路。
+
+**第 19 条来自第三轮补测**：把第 13 条拆分时留下的三处测试空白补齐
+（编排分支 / JWT 能力边界 / Controller 校验映射），并把过程中发现的
+「文档说 QuoteService 有缓存行为未测、实际它根本没有缓存层」一并修正。
+
+后两类容易被当成"环境噪声"跳过，但它们比前面几条更值得修——
 **偶发失败的测试会训练人「红了就重跑」，而重跑恰好是最容易放过真 bug 的动作。**
 
-> 第 9 条是**写单元测试时挖出来的**，不是跑出来的。这也是补测试的真实价值：
+> 第 9、10、11 条是**写单元测试时挖出来的**，不是跑出来的。这也是补测试的真实价值：
 > 它不只防止回归，还会逼你把「文档承诺」和「代码实际做的事」逐条对齐。
+> 第 12 条（编造榜单）更是直接说明：**降级机制本身的正确性，和降级发生后数据是否可信，
+> 是两个需要分别验证的问题。**
+
+---
 
 
 ### 1. 登出是「假成功」——会话未真正吊销
@@ -1031,6 +1160,268 @@ private boolean exists(String prefix, String rawId) {
 
 ---
 
+### 12. 涨幅榜在降级时会返回「编造」的榜单（P0）
+
+**现象**：`GET /quote/movers` 在上游（东方财富）不可达时，返回一份由 10 只固定股票
+排出来的榜单，响应里只有一个 `degraded=true` 标记。
+
+**为什么这条是全部 18 条里最危险的**：其余降级相关的问题至少是"标错了"或"少标了"。
+这一条不同——**榜单光看数字完全无法分辨真假**。价格、涨跌幅、成交额彼此自洽，
+排序也正确，字段类型、接口形状全都正常。它不像「演示数据」那样有固定特征可供识别，
+前端把假榜单当真实行情渲染，用户没有任何线索。
+
+**根因**：降级链 `eastmoney → tencent → mock` 把「能力」和「兜底」混成了一个概念。
+`mock` 被当成任何操作的链尾兜底，但**搜索和榜单是东财独有的能力**（腾讯无对应接口），
+一旦落到 mock，它就会用内置的少量股票拼一份榜单出来。
+
+**修复**：把判断从"调用处"上移到"数据源的能力声明"——`MarketDataProvider` 增加能力位：
+
+```java
+/** 该操作是否允许用本数据源作为降级结果。默认允许。 */
+default boolean acceptableAsFallback(String action) { return true; }
+```
+
+`MockMarketDataProvider` 覆写并**拒绝为榜单供数据**：
+
+```java
+@Override
+public boolean acceptableAsFallback(String action) {
+    return !"getTopMovers".equals(action);   // 榜单宁可不可用，也不编造
+}
+```
+
+路由器遇到"被声明拒绝"的操作时**根本不调用**该数据源，并单独累加
+`app.market_data.fabrication_refused` 指标——**单独计数是必须的**，
+否则「数据源拒绝供数」会被算进「降级成功」里，问题又被掩盖一层。
+
+最终行为：整体降级时 `/quote/movers` 返回 **503 +「市场榜单暂不可用」**，
+前端显示「暂不可用」并保留上一批数据，不再静默换上假榜单。
+
+**两侧实测**：部署环境（8088 后端）`GET /api/v1/quote/movers` 返回 **503**，
+符合设计；本地上游可达时正常返回真实榜单。新增 6 项单测（`FabricationRefused` 嵌套类）。
+
+**设计原则**：**「降级」不等于「什么都用演示数据顶上」。** 可以降级的操作、
+与宁可不可用的操作，必须分开声明——否则「降级机制正常工作」和「降级后数据可信」
+这两个独立命题会被混成一个。
+
+---
+
+### 13. `AnalysisService` 是 954 行 / 42 方法的 god class（P1）
+
+**现状**：一个类里塞了 6 类职责——流程编排、数据装配、Prompt 拼接
+（`barsBlock` / `indicatorBlock` / `fundamentalBlock`）、规则引擎
+（`ruleThesis` / `ruleBullCase` / `ruleBearCase`）、LLM JSON 解析、报告归档。
+**整个模块 0 测试**。
+
+**"能不能测"本身就是设计问题**：不是"没时间写测试"，而是**结构上无法测试**。
+954 行里绝大部分是纯逻辑（拼字符串、判分支、解析 JSON），却与 I/O 缠在一起，
+想验证任何一条规则都得先起整个 Spring 上下文。
+
+**修复**：按职责拆到 `modules/analysis/support/`，`AnalysisService` 退化为薄编排：
+
+| 类 | 职责 |
+|---|---|
+| `AnalysisInputLoader` | 三路并发取数（报价 / 指标 / 基本面）+ 逐路兜底。**Spring Bean，仍未单测**（测它要搭三个依赖的替身） |
+| `PromptBuilder` | 拼 Prompt（纯函数） |
+| `RuleBasedReportGenerator` | 无大模型时的规则化报告（纯函数） |
+| `LlmJsonParser` | 解析大模型返回，容错（纯函数） |
+| `AiReportArchiver` | 存档；**归档失败不影响主流程** |
+| `AnalysisLimits` / `AnalysisInput` / `Formats` | 阈值常量、输入聚合、数字格式化 |
+
+**结果**：新增 **34 项测试**覆盖 Prompt 组装、规则兜底、JSON 容错解析
+（缺字段 / 前后有多余文本 / 类型不符 / 空响应）。后端测试总数 333 → **373**。
+此后第二轮又补了 27 项：`AnalysisService` 编排分支 9 项、`JwtTokenService` 能力边界 9 项、
+`AuthController` 校验与异常映射 9 项（见 §6.19），总数 **400**。
+
+**刻意没假装覆盖的部分**：「读存档还是重新生成」这条分支判定、三路
+`CompletableFuture` 的逐路兜底，仍无单测——已在 §7 如实标注。
+
+---
+
+### 14. 前端零测试（P1）
+
+**现状**：27 个文件 / 5,778 行，只有 `vue-tsc` 类型检查，无 vitest / jest，
+`package.json` 里连 `test` 脚本都没有。类型检查能抓拼写和形状错误，
+但抓不到**状态机判断错误**。
+
+**为什么专挑 `marketSource` store 补测试**：它是第 7 条修复的落点，
+判断规则也最容易写错——「后端不可达」与「后端可达但降级」是两种不同状态，
+原实现把它们混成了一个（表现就是后端整体挂掉时横幅反而不显示）。
+这类「四种状态 + 恢复后清除」的逻辑手工点页面很难覆盖全，正是单测的强项。
+
+**修复**：引入 Vitest + jsdom，新增 `src/stores/marketSource.test.ts`，**7 项**覆盖
+四种状态（真实 / 降级 / 不可达 / 恢复）与对应的徽标文案、告警等级，
+以及「从不可达恢复后告警必须清除」。`npm run test` 与 `npm run build` 串在一条链上。
+
+---
+
+### 15. 首屏 bundle 全量引入，gzip 约 735 KB（P2）
+
+**现状**：`BaseChart.vue` 用 `import * as echarts from 'echarts'`（全量），
+`main.ts` 全量 `app.use(ElementPlus)` + `element-plus/dist/index.css`。
+路由懒加载做对了，但这**两个大包是首屏硬成本**。
+
+**实测（改造前）**：`echarts` chunk 1,117.14 kB（gzip **370.60 kB**）、
+`element` chunk 985.77 kB（gzip **316.40 kB**）、样式另有 gzip 47.92 kB，
+合计约 **735 kB gzip**。
+
+**修复**：
+
+- **ECharts**：改 `echarts/core` + 按需注册（`CandlestickChart` / `LineChart` / `BarChart`
+  + tooltip / legend / grid / dataZoom / axisPointer + `CanvasRenderer`）。
+  **这份清单必须与视图里的 option 一一对应，漏一个只在运行时报错**——
+  少注册 `GridComponent` 是整张图空白（最坑），少注册 `CandlestickChart`
+  才会明确报「Series candlestick is used but not imported」。对应关系写在 `BaseChart.vue` 注释里。
+- **Element Plus**：`unplugin-vue-components` 的 `ElementPlusResolver` 在编译期解析
+  `<el-xxx>` 并连带引样式，于是去掉了 `app.use(ElementPlus)` 与全量 CSS。
+  两个必须手工补的地方：**函数式组件**（`ElMessage` / `ElMessageBox`）与
+  **指令**（`v-loading`）不是模板标签，解析器管不到，样式要在 `main.ts` 显式引 3 个入口；
+  **语言包**要改用根组件 `<el-config-provider :locale="zhCn">`，
+  否则分页、空态等内置文案会退回英文。
+- **没有引入 `unplugin-auto-import`**：它能省掉 `ElMessage` 的 import，
+  代价是这些符号变成来源不明的全局变量。装过又删了，`package.json` 里没有它。
+
+**实测（改造后）**：合计约 **415 kB gzip（−43%）**。逐项对比见 §5.4。
+**前后两组数字都是实测产物，不是估算。**
+
+---
+
+### 16. 没有数据库迁移机制（P0）
+
+**现状**：`pom.xml` 里没有任何迁移工具，`db/schema-mysql.sql` 只有
+`CREATE TABLE IF NOT EXISTS`，**`ALTER TABLE` 0 条**。
+配合 MySQL 数据卷持久化 + 一次性 `db-init` 容器"成功退出"，
+结果是：**给实体加字段时没有任何迁移路径**，只能手工改库或清库重建。
+
+**修复**：引入 Flyway，并把 DDL 的归属收敛到唯一一处。
+
+- 依赖用 **`spring-boot-starter-flyway` + `flyway-mysql`**（不是只写 `flyway-core`，
+  原因见 §1 的坑）；
+- 迁移脚本 `db/migration/{mysql,h2}/V1__baseline.sql`（按 `{vendor}` 占位符分方言）；
+- **不丢已有数据**：`baseline-on-migrate: true` + `baseline-version: 1`，
+  既有库首次启动只打基线、跳过 V1；`validate-on-migrate: true` 阻止事后改动已执行的迁移；
+- 删除 `db/schema-h2.sql`、`db/schema-mysql.sql`，以及 compose 里那个一次性 `db-init` 容器
+  ——**建表这件事必须只有一个归属**。两套机制并存时，`db-init` 会把表建出来、
+  Flyway 只看到"结构非空"而打基线，结果是**谁都没有真正管过结构演进**。
+
+**两条路径都实跑验过**：空库 → 执行 V1 建表，注册/登录/自选股可用；
+既有库 → `users` / `holdings` / `ai_reports` / `watchlist_groups` 行数与升级前
+**逐条一致**，`flyway_schema_history` 记录 `type=BASELINE, success=1`。
+
+**代价（如实记录）**：应用账号现在需要 DDL 权限（Flyway 要建 `flyway_schema_history`）。
+环境不允许时用 `spring.flyway.user` / `spring.flyway.password` 指定独立迁移账号。
+
+---
+
+### 17. 后端整体不可达时，降级横幅反而不显示（P1）
+
+**现象**：后端完全挂掉时，前端顶部那条「当前行情包含演示数据」的告警**不出现**；
+反而只有后端活着但降级时才出现。**最需要提示的时候没有提示。**
+
+**根因**：`marketSource` store 的 `warning` 依赖 `status.value` 非空，
+而 `refresh()` 请求失败时 `status` 保持 `null` —— 于是「后端不可达」这个
+**最严重**的状态，恰好落进了「没有 status 就没有告警」的分支。
+
+**修复**：告警判据改为基于 `lastError`：
+
+```ts
+const unreachable = computed(() => lastError.value !== null)
+```
+
+后端不可达时 `badgeText` / `warningTitle` 都切到「无法确认行情真实性」，
+语义上和「已降级但能确认」区分开。另外两处配套：
+
+- `DefaultLayout` 增加 **30s 周期复检**（`source.refresh()`），
+  后端恢复后横幅能自动撤下，不必手动刷新页面；
+- 各区块失败时**显示具体原因**，不再静默空着。
+
+**为什么值得单列**：这是"降级机制"最典型的反直觉失效——**机制本身没坏，
+是它的触发条件写反了**，而写反的那一版在任何"后端正常"的测试里都看不出来。
+第 14 条的 7 项 store 单测正是为此而补。
+
+---
+
+### 18. 部署链路的两个缺陷：镜像落后于源码 + 前端缺 `.dockerignore`（P2）
+
+**这条不是走查出来的，是复跑部署时才发现的。**
+
+**缺陷 A：部署镜像落后于源码。** 8088 上前端产物是 `element-*.js = 985,775 B`，
+而本地刚构建的是 `591,615 B` —— **部署环境跑的是改造前的构建**。
+根因不是构建缓存，而是**时序**：那次 `docker compose up -d --build` 是为
+第 16 条（Flyway）而跑的，跑完我才开始改前端。于是镜像"看起来很新"（`docker images`
+显示 `26 minutes ago`），内容却是旧的。
+
+**判定方法（比看时间可靠得多）**：直接比**产物字节数**——
+
+```bash
+docker exec stocklab-frontend ls -l /usr/share/nginx/html/assets | grep -E 'element|echarts'
+```
+
+与本地 `dist/assets` 对不上就是旧的。完整步骤与基准字节数写进了 §3.4。
+
+**顺带一个时区坑**：`docker images` 的 `CreatedSince` 按本地时区显示，
+而 `docker inspect` 的 `.Created` 是 **UTC**。我用 `toISOString()` 读源码 mtime（UTC）
+去和本地时间比较，一度把「改动晚于镜像」读成「改动早于镜像」，**险些得出相反的结论**。
+
+**缺陷 B：前端没有 `.dockerignore`。** `frontend/Dockerfile` 第一阶段是
+`npm ci` 之后再 `COPY . .`，没有 `.dockerignore` 时**宿主机的 `node_modules`
+会把容器里刚装好的依赖树整个盖掉**：
+
+- 宿主机（Windows / macOS）装的 esbuild / rolldown 原生二进制属于 `win32-x64` /
+  `darwin-arm64`，与容器内的 `linux-x64` 版本并存——现在能跑对只是因为 Node 按
+  `process.platform` 解析，属"碰巧没事"，不是有保证的行为；
+- 更实质的风险是 **`npm ci` 的「按锁文件精确还原」被架空**：COPY 会覆盖同名文件，
+  宿主机 `node_modules` 若与 `package-lock.json` 不同步，构建就用宿主机那一份。
+
+已新增 `frontend/.dockerignore`（排除 `node_modules/`、`dist/`、`.vite/`）。
+`backend/Dockerfile` 用的是 `COPY src ./src`（显式指定目录），不受影响。
+
+**重建后的验证（全部看字节数 / 实际响应，不看时间）**：
+
+| 校验项 | 结果 |
+|---|---|
+| 前端镜像内 `element-*.js` | **591,615 B**（旧值 985,775） |
+| 前端镜像内 `echarts-*.js` | **579,243 B**（旧值 1,117,148） |
+| 8088 实际返回的 `element-*.js` | `content-length: 591615` |
+| 容器 `.Image` vs `deploy-frontend:latest` 的 `.Id` | 相等 |
+| 后端 `/actuator/health` | `{"status":"UP"}` |
+| `GET /api/v1/analysis/600519` | 200，`model=qwen-plus`（真实大模型）→ 第 13 条拆分后的协作者链路在部署环境正常 |
+| `GET /api/v1/quote/movers` | **503**（上游不可达 → 拒绝编造）→ 第 12 条的修复在部署环境生效 |
+| MySQL 数据 | `users` / `holdings` / `ai_reports` / `watchlist_groups` 行数与升级前**逐条一致** |
+
+### 19. 第二轮补测：三处「失效不报错」的测试空白（P1）
+
+**现象**：第一轮优化（第 13 条）把 `AnalysisService` 拆成协作者时补了 34 项纯函数测试，
+但三个关键区域仍然没有测试，且失效形态都是「接口照常 200，日志一行 ERROR 都没有」：
+
+1. `AnalysisService` 的**编排分支**——存档命中时不调模型、`forceRefresh` 时连存档都不读、
+   取不到报价时在进入模型调用前就 404。坏了的表现是「每次都重新生成，账单变贵」或
+   「不存在的代码也在烧模型费用」，用户与日志都无感知；
+2. `JwtTokenService` 的**能力边界**——过期 / 篡改 / 类型混用 / 跨 issuer 各该映射到
+   哪个错误码。映射错了会把「该静默刷新」的用户踢去登录页，或把「该跳登录」的用户
+   留在死循环里；
+3. **Controller 层的校验与异常映射**——DTO 少一个 `@Valid`、异常处理器少一个分支，
+   非法输入会直穿到 Service。
+
+**修复**：新增 3 个测试类共 27 项，全部一次通过：
+
+| 测试类 | 项数 | 钉住的关键断言 |
+|---|---|---|
+| `AnalysisServiceOrchestrationTest` | 9 | 存档命中 → `verifyNoInteractions(llmClient)`（零次模型调用）；取不到报价 → `verifyNoInteractions(inputLoader, llmClient)`（钱断在第一步）；LLM 失败 → `notice` 必含失败原因 + `app.analysis.fallback` 指标计数 |
+| `JwtTokenServiceTest` | 9 | 过期→`AUTH_EXPIRED`、篡改/类型混用/跨 issuer/垃圾输入→`AUTH_INVALID` 各自成立；无 `sid` 旧令牌被容忍；短密钥在构造期即抛 `WeakKeyException` |
+| `AuthControllerValidationTest` | 9 | standalone MockMvc + `GlobalExceptionHandler`：非法手机号/短密码/缺字段/坏 JSON 全部 400 + 字段级提示；`BizException` 按错误码映射 HTTP（401/409）；**登录接口对格式古怪的手机号不做格式校验（防用户枚举）**也被钉住，防止将来被「顺手优化」掉 |
+
+**顺带发现并修正的文档失实**：§7.7 原文说「`QuoteService` 缓存行为未测」——
+核对代码发现 `QuoteService` **根本没有缓存层**（每次调用直达行情 Provider，
+上游看到的请求量与用户请求量 1:1）。「未测」的前提是有东西可测，原文把
+「不存在」写成了「未验证」。已改写为如实的边界说明（见 §7.7），
+并把「加短 TTL 缓存」列为后续改进项。
+
+**教训**：文档里每一条「未验证」都要定期对着代码重新核对——
+代码演进后，「未验证 X」可能悄悄变成「X 已不存在」，读者却仍会照着旧地图找路。
+
+---
+
 ## 七、已知边界（不要当成已实现）
 
 1. **会话吊销存储默认仍是进程内存，多实例部署必须显式切换**。
@@ -1072,24 +1463,31 @@ private boolean exists(String prefix, String rawId) {
 5. **`/quote/search` 的中文必须先 URL 编码**。Tomcat 11 会按 RFC 7230 拒绝请求行里的
    裸非 ASCII 字节并返回 400（HTML 错误页，不是我们的 JSON）。浏览器会自动编码，
    `curl` 直接传中文会失败。
-6. **前端 bundle 未做按需引入**。Element Plus 全量引入，实测 `element` chunk
-   **985.75 kB（gzip 316.39 kB）**，`echarts` chunk **1,117.14 kB（gzip 370.60 kB）**，
-   两者合计已占首屏绝大部分。改为按需引入需加 `unplugin-vue-components`，
-   当前为降低脚手架复杂度未做。**体积数据是实测的，不是估算**。
-7. **单元测试是 15 个类 / 297 项，不是"覆盖完了"**。明细见 §5.1，
-   生产级能力的验证状态见 §5.3 矩阵。**以下仍然没有单元测试**，
-   目前只有 HTTP 冒烟这一层兜着：
-   - `QuoteService`（降级链路切换后的缓存行为、缓存击穿）
-   - `AnalysisService` 的业务逻辑（存档命中 / 强制重生成的判定、异步扇出
-     三路 `CompletableFuture` 的逐路兜底）——**矩阵里标的是 ⚠️**
-   - 所有 Controller 层（参数校验、异常映射、`@Valid` 边界）
-   - `JwtTokenService` 的独立用例（目前只作为 `AuthServiceTest` 的真实依赖
-     被间接覆盖，没针对它自己的能力边界写用例，
-     例如令牌过期边界的时钟偏移容忍）
-   - 前端**完全没有测试**（无 Vitest / Playwright，只有类型检查 + 构建 +
-     浏览器手工验证）
+6. **前端 bundle 已做按需引入（本轮完成）**。改造前 Element Plus 全量引入 +
+   ECharts 全量引入，实测 `element` chunk **985.77 kB（gzip 316.40 kB）**、
+   `echarts` chunk **1,117.14 kB（gzip 370.60 kB）**、样式另有 **gzip 47.92 kB**，
+   合计约 735 kB gzip。改为按需后合计约 **415 kB gzip（−43%）**，
+   逐项对比与改法见 §5.4。**体积数据前后都是实测的，不是估算。**
+7. **单元测试是 23 个类 / 400 项，不是"覆盖完了"**。明细见 §5.1，
+   生产级能力的验证状态见 §5.3 矩阵。仍没有单元测试、只有 HTTP 冒烟兜着的：
+   - **其余 7 个 Controller**。`AuthControllerValidationTest`（9 项，standalone
+     MockMvc）只钉住了鉴权接口的参数校验与异常映射链路，作为模式样板；
+     Watchlist / Holding / Analysis / Fundamental / Indicator / News / Quote
+     的校验边界仍靠冒烟。standalone 模式也不覆盖 `@RateLimit` 切面与
+     `@CurrentUserId` 参数解析器——这两块只有集成环境能验证
+   - `QuoteService` 的**上游包装方法**（`getQuote` / `getBars` / `topMovers` /
+     `sourceStatus`）。已有测试只覆盖轮播切片（`getCarousel`）。
+     另外要说清一个事实：**`QuoteService` 没有缓存层**，每次调用直达
+     `ResilientMarketDataProvider`——上游（东方财富/腾讯）看到的请求量
+     与用户请求量 1:1。首页轮播 10 秒换批意味着持续打上游。
+     短 TTL 缓存是后续值得做的改进，做的时候缓存命中/过期/击穿需要一起补测
+   - `AnalysisInputLoader` 的**异步扇出**三路 `CompletableFuture` 的逐路兜底
+     （编排分支判定已由 `AnalysisServiceOrchestrationTest` 9 项覆盖，矩阵仍 ⚠️）
+   - 前端**组件与交互路径仍无测试**：本轮补的是 7 项 store 单测
+     （`marketSource` 的四种状态与恢复后清除），组件渲染、表单提交、
+     WebSocket 驱动的价格刷新仍未覆盖
 
-   补的顺序建议按「改了容易出事」排：`QuoteService` > `AnalysisService` > 其余。
+   补的顺序建议按「改了容易出事」排：`QuoteService` 上游包装 > 其余 Controller > 前端组件。
    判断依据不是「哪个重要」，而是**哪个失效时不会报错**——
    缓存少刷新一次、扇出某一路静默返回 null、Controller 少一个 `@Valid`
    导致非法入参直穿到 Service，接口全都照样返回 200，日志里一行 ERROR 都没有。
@@ -1147,7 +1545,44 @@ private boolean exists(String prefix, String rawId) {
 
 ## 八、成本与风险提示
 
-- 行情与资讯接口均为公开未鉴权接口，**上游随时可能变更或限流**。
+### 8.1 数据接入方式与授权状态（如实说明）
+
+**本工程的行情与资讯数据，不是通过授权渠道、也不是通过官方开放 API 获取的**，
+而是直接请求第三方财经网站**给自家网页使用的内部数据接口**。完整清点与实测证据见
+[`docs/数据来源与授权状态说明-20260924.md`](docs/数据来源与授权状态说明-20260924.md)。
+
+| 数据域 | 上游 | 接口 | 接入方式 | 授权状态 |
+|--------|------|------|---------|---------|
+| 实时报价 | 东方财富 | `push2.eastmoney.com/api/qt/stock/get` | JSON 结构解析 | ❌ 未授权 |
+| K 线 | 东方财富 | `push2his.eastmoney.com/api/qt/stock/kline/get` | JSON 结构解析 | ❌ 未授权 |
+| 榜单 / 全 A 清单 | 东方财富 | `push2.eastmoney.com/api/qt/clist/get` | JSON 结构解析 | ❌ 未授权 |
+| 指数 | 东方财富 | `push2.eastmoney.com/api/qt/ulist.np/get` | JSON 结构解析 | ❌ 未授权 |
+| 财务 | 东方财富 | `datacenter-web.eastmoney.com/api/data/v1/get` | JSON 结构解析 | ❌ 未授权 |
+| 备用报价 / K 线 | 腾讯 | `qt.gtimg.cn` / `web.ifzq.gtimg.cn` | GBK 文本协议 | ❌ 未授权 |
+| 财经资讯 | 新浪 | `feed.mix.sina.com.cn/api/roll/get` | JSON 结构解析 | ❌ 未授权 |
+| AI 研判 | DeepSeek / 阿里云百炼 | `api.deepseek.com` / `dashscope.aliyuncs.com` | 官方 API + API Key | ✅ 已授权 |
+
+两点必须说清楚：
+
+1. **不是「爬虫」，但也不是「正规接入」**。工程 `pom.xml` 未引入任何 HTML 解析库
+   （jsoup / htmlunit / selenium / playwright 全无），全部请求都落在**接口域名**上，
+   返回 JSON 或文本协议，属**未授权接口抓取**，与爬虫的合规风险量级接近。
+2. **请求头伪装成浏览器**（`RestClientConfig.java:31-36`）：统一把 `User-Agent`
+   写成 Chrome/120，并按域名附带 `Referer: https://finance.eastmoney.com/` 或
+   `https://finance.sina.com.cn/`。原因见同文件注释：部分接口校验 Referer，
+   缺失时**返回空数据而非报错**（静默失败，最难排查）。无 Cookie、无登录、无 API Key。
+
+**代价已经在生产行为上出现**：上游随时可能改字段、加风控、直接断连。
+实测到的就是东财 `header parser received no bytes` / `EOF reached while reading`
+（服务端主动断连，IP 级风控），以及由此触发的涨幅榜间歇性退回演示数据。
+
+要往合规方向走，只有两条路：换成**有授权/有付费协议**的数据源
+（Tushare、同花顺 iFinD、Wind、券商行情接口，或交易所授权的行情服务商），
+或者**保留现有源但去掉伪装**、明确标注来源、严格控制调用频率。
+
+### 8.2 稳定性与降级
+
+- 上游**随时可能变更或限流**。
   实测到的现象是：**不可达是按路径、间歇发生的**——报价路径连续 3 轮全部失败，
   而同一主机的指数路径和 K 线路径在 3 轮里各成功过一次（明细见 §5.2）。
   换句话说，上游不是「挂了」，而是「时通时断、各路径不一致」，
@@ -1157,6 +1592,7 @@ private boolean exists(String prefix, String rawId) {
 - 正因为上游是间歇性的，**降级链路的「哪一路降了、哪一路没降」必须能被看见**，
   否则同一份代码在不同时刻给出不同数据质量，而使用者无从判断。
   `/quote/source` 的 `servingByAction` 就是为此存在的（见 §5.2 与第六节第 10 条）。
+  注意它**只反映最近一次调用**，不能用来判断「当前整体是否降级」。
 - 应用的降级设计保证上游挂掉时不白屏，但**降级数据一律有明确标注**。
   任何情况下都不要把演示数据用真实行情的口吻呈现。
 - **本应用不构成任何投资建议。**

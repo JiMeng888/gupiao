@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# 前端构建上下文排除清单
+#
+# 为什么必须有这个文件（不是"顺手优化"）：
+# Dockerfile 的第一阶段是 `COPY package.json package-lock.json* ./` +
+# `npm ci`，再 `COPY . .`。没有 .dockerignore 时，第二条 COPY 会把宿主机
+# 的 node_modules 整个盖到容器里刚装好的依赖树之上，后果是：
+#
+#   1. 平台错配：宿主机（Windows/macOS）装的 esbuild / rolldown 等原生二进制
+#      属于 win32-x64 / darwin-arm64，被复制进 Linux 容器后与 linux-x64 版本
+#      并存。Node 按 process.platform 解析，多数情况能跑对，但这是"碰巧没事"，
+#      不是有保证的行为。
+#   2. 依赖树与锁文件脱钩：COPY 会覆盖同名文件。宿主机 node_modules 若与
+#      package-lock.json 不同步（比如本地升过一个包却没提交锁文件），
+#      构建就会用宿主机那一份，`npm ci` 的"按锁文件精确还原"就失效了。
+#   3. 构建变慢：宿主机 node_modules 动辄几百 MB，每次都要打进构建上下文
+#      并触发缓存失效。
+#
+# dist/ 也排除：它由容器内 `npm run build` 生成，传进去只会白占上下文，
+# 且容易让人误以为镜像是"拷了本地 dist"的结果。
+#
+# 对照：backend/Dockerfile 用的是 `COPY src ./src`（显式指定目录），
+# 因此不受此影响，不需要 .dockerignore。
+# ---------------------------------------------------------------------------
+
+node_modules/
+dist/
+.vite/
+
+# 本地构建/测试输出与日志
+*.log
+coverage/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

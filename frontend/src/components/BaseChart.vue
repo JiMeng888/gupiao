@@ -1,7 +1,50 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
-import * as echarts from 'echarts'
+import * as echarts from 'echarts/core'
+import { BarChart, CandlestickChart, LineChart } from 'echarts/charts'
+import {
+  AxisPointerComponent,
+  DataZoomComponent,
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+} from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+// 仅类型导入，编译后被完全擦除，不会把全量包带回来。
 import type { EChartsOption } from 'echarts'
+
+/**
+ * ECharts 按需注册。
+ *
+ * <p>改成按需之前这里是 `import * as echarts from 'echarts'`，打包后 echarts
+ * chunk 为 1117 kB / gzip 370 kB——而项目只用到蜡烛图、折线、柱状三种系列。
+ *
+ * <p><b>这份清单必须与视图里的 option 一一对应，漏一个的后果是运行时报错
+ * 而不是编译报错</b>：少注册 `CandlestickChart` 会得到
+ * 「Series candlestick is used but not imported」，少注册 `GridComponent`
+ * 则整个直角坐标系不渲染（图表一片空白）。因此新增图表类型时，
+ * 除了写 option，还要回到这里补注册。
+ *
+ * 当前对应关系（见 {@code StockDetailView.vue}）：
+ *   - 系列 candlestick / line / bar
+ *   - 组件 tooltip（axisPointer 的 cross 依赖 AxisPointerComponent）、
+ *     legend、grid（含 xAxis / yAxis）、dataZoom（inside 与 slider 两种）
+ *   - 渲染器 Canvas
+ *
+ * `showLoading('default')` 用的默认加载动效在 echarts/core 里自带
+ * （lib/core/echarts.js 直接 import 了 loading/default），无需额外注册。
+ */
+echarts.use([
+  BarChart,
+  CandlestickChart,
+  LineChart,
+  AxisPointerComponent,
+  DataZoomComponent,
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+  CanvasRenderer,
+])
 
 /**
  * ECharts 容器。

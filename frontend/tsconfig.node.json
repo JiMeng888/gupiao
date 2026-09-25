@@ -1,5 +1,5 @@
 {
-  // 独立的第二份配置：只用于检查 Node 侧构建脚本（vite.config.ts）。
+  // 独立的第二份配置：只用于检查 Node 侧构建脚本（vite.config.ts / vitest.config.ts）。
   // 刻意不使用 project references —— 被引用的工程若设 noEmit，tsc 会报 TS6310
   // （"Referenced project may not disable emit"），除非改用 --build 模式。
   // 对脚手架而言，用两个互不引用的配置 + 两次显式检查更直观、更好排查。
@@ -19,5 +19,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["vite.config.ts"]
+  "include": ["vite.config.ts", "vitest.config.ts"]
 }

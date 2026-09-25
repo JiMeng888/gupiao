@@ -25,7 +25,7 @@ import java.util.regex.Pattern;
 /**
  * 新浪财经资讯源客户端。
  *
- * <p>选新浪 {@code feed.mix.sina.com.cn} 的理由：公开 JSON 接口、无需鉴权、
+ * <p>选新浪 {@code feed.mix.sina.com.cn} 的理由：内部 JSON 接口（未获新浪授权）、无需鉴权、
  * 无 Cookie 与防爬拦截、结构稳定（已运行十年以上），覆盖财经要闻 / A 股 /
  * 港股 / 美股 / 全球市场五个频道。
  *
@@ -46,7 +46,7 @@ public class SinaNewsClient {
     private static final Logger log = LoggerFactory.getLogger(SinaNewsClient.class);
 
     private static final String FEED_URL =
-            "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=%s&num=%d&versionNumber=1.2.4&page=1";
+            "https://feed.mix.sina.com.cn/api/roll/get?pageid=%s&lid=%s&num=%d&versionNumber=1.2.4&page=1";
 
     /** 单频道固定拉取条数。 */
     private static final int FETCH_SIZE = 30;
@@ -85,7 +85,7 @@ public class SinaNewsClient {
      */
     @Cacheable(cacheNames = CacheNames.NEWS, key = "'ch:' + #channel.name()", sync = true)
     public List<NewsItem> fetchChannel(NewsChannel channel) {
-        String url = FEED_URL.formatted(channel.lid(), FETCH_SIZE);
+        String url = FEED_URL.formatted(channel.pageid(), channel.lid(), FETCH_SIZE);
         JsonNode root;
         try {
             String body = restClient.get().uri(URI.create(url)).retrieve().body(String.class);
@@ -260,14 +260,15 @@ public class SinaNewsClient {
 
     private void markFailure(NewsChannel channel, RuntimeException ex) {
         meterRegistry.counter("app.news.fetch.failure", "channel", channel.id()).increment();
-        log.warn("资讯拉取失败 channel={} lid={}：{}", channel.id(), channel.lid(), ex.toString());
+        log.warn("资讯拉取失败 channel={} pageid={} lid={}：{}",
+                channel.id(), channel.pageid(), channel.lid(), ex.toString());
     }
 
     /** 供监控端查看的频道元信息。 */
     public Map<String, String> channelIntrospection() {
         Map<String, String> map = new LinkedHashMap<>();
         for (NewsChannel channel : NewsChannel.values()) {
-            map.put(channel.id(), channel.lid() + "/" + channel.displayName());
+            map.put(channel.id(), channel.pageid() + "/" + channel.lid() + "/" + channel.displayName());
         }
         return map;
     }

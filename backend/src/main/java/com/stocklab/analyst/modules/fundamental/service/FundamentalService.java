@@ -29,7 +29,8 @@ import java.util.Optional;
  * 财务数据与行情不同——行情错了用户一眼能看出，财务数据错了用户会当真。
  * 因此本服务遵循两条硬规则：
  * <ol>
- *   <li><b>能取真实数据就绝不用估算值。</b>真实数据来自东方财富公开披露接口。</li>
+ *   <li><b>能取真实数据就绝不用估算值。</b>真实数据来自东方财富<b>内部数据接口</b>
+ *       （未获数据方授权，详见 {@code docs/数据来源与授权状态说明-20260924.md}）。</li>
  *   <li><b>使用估算值时必须在响应里标注。</b>{@code dataSource=estimated} 且
  *       {@code notice} 给出明确提示，前端必须显式展示该标识。</li>
  * </ol>
@@ -48,7 +49,17 @@ public class FundamentalService {
     private static final String SOURCE_REAL = "eastmoney";
     private static final String SOURCE_ESTIMATED = "estimated";
 
-    private static final String REAL_NOTICE = "数据来源：东方财富公开披露接口，仅作研究参考，不构成投资建议";
+    /**
+     * 真实数据时的来源标注。措辞刻意区分两件事：
+     * <ul>
+     *   <li><b>内容层面</b>：财报是上市公司强制公开披露的信息，本身是公开的；</li>
+     *   <li><b>渠道层面</b>：我们是调东方财富给自家网页用的内部接口拿到的，未获授权。</li>
+     * </ul>
+     * 以前这里写的是「东方财富公开披露接口」，把「内容公开」和「接口获准」混成了一件事。
+     */
+    private static final String REAL_NOTICE =
+            "数据来源：东方财富内部数据接口（未获数据方授权）；财报内容为上市公司公开披露信息，"
+                    + "仅作研究参考，不构成投资建议";
     private static final String ESTIMATED_NOTICE =
             "当前为估算数据（未连接真实财务数据源），与实际财务状况无关，请勿据此决策";
 
@@ -275,7 +286,8 @@ public class FundamentalService {
 
         String notice = views.isEmpty()
                 ? "暂未获取到该标的的业绩披露数据（可能为新上市、停牌或数据源不可用）"
-                : "数据来源：东方财富公开披露数据；A 股财报为年内累计值，趋势比较请使用同一报告期口径";
+                : "数据来源：东方财富内部数据接口；财报为上市公司公开披露信息。"
+                        + "A 股财报为年内累计值，趋势比较请使用同一报告期口径";
 
         return new StatementsResponse(code, name, industry,
                 views.isEmpty() ? "unavailable" : SOURCE_REAL, views, notice);

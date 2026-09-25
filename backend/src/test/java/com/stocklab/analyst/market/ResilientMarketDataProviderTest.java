@@ -20,6 +20,7 @@ import org.springframework.http.HttpStatus;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -64,6 +65,7 @@ class ResilientMarketDataProviderTest {
     private static final String ACTION_BARS = "getBars";
     private static final String ACTION_INDICES = "getIndices";
     private static final String ACTION_SEARCH = "search";
+    private static final String ACTION_MOVERS = "getTopMovers";
 
     private SimpleMeterRegistry registry;
     private FakeProvider primary;
@@ -88,6 +90,24 @@ class ResilientMarketDataProviderTest {
     /** 上游不可用计数器当前值（关闭降级时走这条）。 */
     private Double unavailableMetric(String action) {
         return metric("app.market_data.unavailable", action);
+    }
+
+    /** 降级源「策略拒绝编造数据」计数器当前值。 */
+    private Double refusalMetric(String action) {
+        return metric("app.market_data.fabrication_refused", action);
+    }
+
+    /**
+     * 按 {@code from} 标签读取降级计数器——它记录的是<b>失败的那一级</b>。
+     *
+     * <p>「主源失败」与「降级源被跳过/拒绝」都会累加同一个计数器名，
+     * 只有 {@code from} 能区分它们，因此这里的断言必须带标签读，
+     * 否则无法证明「拒绝没有被记成降级」。
+     */
+    private Double fallbackMetricFrom(String action, String fromProvider) {
+        Counter counter = registry.find("app.market_data.fallback")
+                .tag("action", action).tag("from", fromProvider).counter();
+        return counter == null ? null : counter.count();
     }
 
     private Double metric(String name, String action) {
@@ -811,6 +831,119 @@ class ResilientMarketDataProviderTest {
     }
 
     // ==================================================================
+    @Nested
+    @DisplayName("演示数据「策略拒绝」")
+    class FabricationRefused {
+
+        @Test
+        @DisplayName("降级源声明拒绝榜单时抛 503，而不是返回编造的排名")
+        void refusesToFabricateRanking() {
+            primary.failAlways(unavailable("东财被风控断连"));
+            fallback.refuseAsFallback(ACTION_MOVERS);
+
+            MarketDataUnavailableException ex = catchThrowableOfType(
+                    () -> router(true).getTopMovers(MoverMetric.CHANGE_PCT, false, 10),
+                    MarketDataUnavailableException.class);
+
+            assertThat(ex).isNotNull();
+            assertThat(ex.getCode()).isEqualTo(ErrorCode.MARKET_DATA_UNAVAILABLE.name());
+            assertThat(ex.getMessage())
+                    .as("这条消息会经 503 直接返回前端并可能显示给用户，必须是人话")
+                    .contains("市场榜单")
+                    .doesNotContain("getTopMovers");
+        }
+
+        /**
+         * 这条是整个特性的核心：拒绝必须发生在「调用之前」。
+         * 若先调用再丢弃结果，编造数据仍然会经过数据源实现，
+         * 且任何一处忘记判空的调用方都会拿到它。
+         */
+        @Test
+        @DisplayName("被拒绝的操作根本不调用降级源")
+        void neverAsksTheRefusingProvider() {
+            primary.failAlways(unavailable("东财被风控断连"));
+            fallback.refuseAsFallback(ACTION_MOVERS);
+
+            catchThrowableOfType(
+                    () -> router(true).getTopMovers(MoverMetric.CHANGE_PCT, false, 10),
+                    MarketDataUnavailableException.class);
+
+            assertThat(fallback.callCount(ACTION_MOVERS))
+                    .as("拒绝的意义是「连取都不取」，否则编造数据仍有流出的路径")
+                    .isZero();
+        }
+
+        @Test
+        @DisplayName("拒绝记 fabrication_refused，且不把降级源记成 fallback")
+        void recordsRefusalNotFallback() {
+            primary.failAlways(unavailable("东财被风控断连"));
+            fallback.refuseAsFallback(ACTION_MOVERS);
+
+            catchThrowableOfType(
+                    () -> router(true).getTopMovers(MoverMetric.CHANGE_PCT, false, 10),
+                    MarketDataUnavailableException.class);
+
+            assertThat(refusalMetric(ACTION_MOVERS)).isEqualTo(1.0);
+            assertThat(fallbackMetricFrom(ACTION_MOVERS, FALLBACK_NAME))
+                    .as("拒绝不等于「降级兜住了」：若把它记成 from=mock 的 fallback，"
+                            + "「榜单永久不可用」在告警上会伪装成「数据质量下降」")
+                    .isNull();
+            assertThat(fallbackMetricFrom(ACTION_MOVERS, PRIMARY_NAME))
+                    .as("主源确实挂了这件事必须照常记录——拒绝逻辑不能顺带吞掉上游故障信号")
+                    .isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("拒绝只作用于被声明的操作，其它操作照常降级")
+        void refusalIsScopedToDeclaredAction() {
+            primary.failAlways(unavailable("东财被风控断连"));
+            fallback.refuseAsFallback(ACTION_MOVERS);
+            ResilientMarketDataProvider router = router(true);
+
+            catchThrowableOfType(
+                    () -> router.getTopMovers(MoverMetric.CHANGE_PCT, false, 10),
+                    MarketDataUnavailableException.class);
+            String quoteName = router.getQuote("600519").name();
+
+            assertThat(quoteName)
+                    .as("报价仍应由降级源顶上——榜单的危险性不能推广到所有操作")
+                    .isEqualTo(FALLBACK_NAME + "-600519");
+        }
+
+        @Test
+        @DisplayName("真实源可用时榜单正常返回，拒绝不影响正常路径")
+        void healthyPrimaryServesMoversAsUsual() {
+            fallback.refuseAsFallback(ACTION_MOVERS);
+
+            List<Mover> movers = router(true).getTopMovers(MoverMetric.CHANGE_PCT, false, 10);
+
+            assertThat(movers).hasSize(1);
+            assertThat(movers.get(0).name()).isEqualTo(PRIMARY_NAME + "-mover");
+            assertThat(refusalMetric(ACTION_MOVERS))
+                    .as("没有走降级，就不存在拒绝")
+                    .isNull();
+        }
+
+        /**
+         * 显式离线模式（{@code provider=mock}）的语义是「用户主动只看演示数据」，
+         * 此时页面没有降级横幅，整个界面就是演示本身，榜单必须保留，
+         * 否则离线演示会缺一块功能。
+         */
+        @Test
+        @DisplayName("降级源自己作为主源（离线模式）时不受拒绝影响")
+        void offlineModeStillServesRanking() {
+            ResilientMarketDataProvider offline = new ResilientMarketDataProvider(
+                    List.of(fallback), true, 0L, registry);
+            fallback.refuseAsFallback(ACTION_MOVERS);
+
+            assertThat(offline.getTopMovers(MoverMetric.CHANGE_PCT, false, 10))
+                    .as("链上只有一级时它就是主源，拒绝规则不适用")
+                    .hasSize(1);
+            assertThat(refusalMetric(ACTION_MOVERS)).isNull();
+        }
+    }
+
+    // ==================================================================
     // 辅助
 
     private static MarketDataUnavailableException unavailable(String message) {
@@ -830,10 +963,21 @@ class ResilientMarketDataProviderTest {
         private RuntimeException failure;
         private final Map<String, RuntimeException> perActionFailure = new java.util.HashMap<>();
         private final Map<String, Integer> callCounts = new java.util.LinkedHashMap<>();
+        private final Set<String> refusedAsFallback = new java.util.HashSet<>();
         private String lastBarsCall;
 
         FakeProvider(String name) {
             this.name = name;
+        }
+
+        /**
+         * 声明「作为降级源时拒绝为这些操作提供数据」。
+         *
+         * <p>模拟演示源对榜单的做法：数据源本身完全有能力返回，
+         * 但不愿意在「用户以为是真实行情」的场合返回编造内容。
+         */
+        void refuseAsFallback(String... actions) {
+            refusedAsFallback.addAll(java.util.Arrays.asList(actions));
         }
 
         /** 让所有操作一律抛指定异常，用于模拟主源整体不可用。 */
@@ -895,6 +1039,11 @@ class ResilientMarketDataProviderTest {
         @Override
         public boolean available() {
             return available;
+        }
+
+        @Override
+        public boolean acceptableAsFallback(String action) {
+            return !refusedAsFallback.contains(action);
         }
 
         @Override

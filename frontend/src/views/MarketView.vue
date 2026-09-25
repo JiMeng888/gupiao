@@ -56,14 +56,26 @@ const board = ref<BoardKey>('gain')
 const movers = ref<Mover[]>([])
 const moversLoading = ref(false)
 
+/**
+ * 榜单失败原因。
+ *
+ * 榜单是所有行情操作里<b>唯一</b>在降级时会被后端明确拒绝的一项
+ * （演示数据不得用于排序结果，见 `MarketDataProvider#acceptableAsFallback`），
+ * 所以这里拿到的 503 不是异常而是设计行为。必须把原因如实显示出来，
+ * 否则用户看到空表格只会以为「今天没有涨的股票」。
+ */
+const moversError = ref<string | null>(null)
+
 async function loadMovers(): Promise<void> {
   moversLoading.value = true
   try {
     const params = BOARD_PARAMS[board.value]
     movers.value = await quoteApi.movers(params.metric, params.order, 10)
-  } catch {
-    // 榜单拿不到（上游抖动）就让表格显示空态，不打断页面其余板块
+    moversError.value = null
+  } catch (e) {
+    // 榜单拿不到就让表格显示原因，不打断页面其余板块
     movers.value = []
+    moversError.value = e instanceof Error ? e.message : '榜单数据暂不可用'
   } finally {
     moversLoading.value = false
   }
@@ -183,7 +195,7 @@ function openBuy(code: string, name: string): void {
           v-loading="moversLoading"
           :data="movers"
           size="small"
-          empty-text="榜单数据暂不可用"
+          :empty-text="moversError ?? '暂无榜单数据'"
           :row-style="{ cursor: 'pointer' }"
           @row-click="(row: Mover) => openStock(row.code)"
         >

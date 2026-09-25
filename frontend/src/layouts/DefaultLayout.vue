@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Search, User, SwitchButton, Setting, Star, Wallet } from '@element-plus/icons-vue'
@@ -24,6 +24,11 @@ const source = useMarketSourceStore()
 const socket = useQuoteSocketStore()
 
 const activeMenu = computed(() => route.path)
+
+/** 数据源状态复检间隔。低频是有意为之：它只需要在故障后「一个周期内」被发现。 */
+const SOURCE_REFRESH_MS = 30_000
+
+let sourceTimer: number | undefined
 
 const searching = ref(false)
 const options = ref<StockBrief[]>([])
@@ -65,6 +70,23 @@ onMounted(() => {
   void source.refresh()
   // 建立实时行情长连接；具体订阅由各页面按需 acquire
   socket.connect()
+
+  // 周期性复检数据源状态。
+  //
+  // 只在挂载时拉一次是不够的：运行中上游才被风控断连、或后端中途挂掉时，
+  // 横幅会一直停留在「一切正常」的状态——而它恰恰是页面唯一一处
+  // 告诉用户「这些数字不可信」的地方。补一个低频轮询（30 秒，
+  // 相对 3 秒的行情推送几乎无成本），让警示能在故障发生后一个周期内出现。
+  sourceTimer = window.setInterval(() => {
+    void source.refresh()
+  }, SOURCE_REFRESH_MS)
+})
+
+onBeforeUnmount(() => {
+  if (sourceTimer !== undefined) {
+    window.clearInterval(sourceTimer)
+    sourceTimer = undefined
+  }
 })
 </script>
 
@@ -158,8 +180,8 @@ onMounted(() => {
          因为任何页面的行情数字都受它影响 -->
     <div v-if="source.warning" class="layout__warning">
       <el-alert
-        :type="source.degraded ? 'error' : 'warning'"
-        :title="source.degraded ? '当前行情包含演示数据' : '行情数据源未就绪'"
+        :type="source.warningType"
+        :title="source.warningTitle ?? '行情数据源异常'"
         :description="source.warning"
         show-icon
         :closable="false"
@@ -174,11 +196,22 @@ onMounted(() => {
       </router-view>
     </main>
 
+    <!-- 页脚免责声明。
+         这里以前写的是「行情为公开接口」——「公开」二字很容易被读成
+         「已获数据方授权」，而实际上游是各家财经网站给自家网页用的内部接口，
+         既没有授权，也没有可用性承诺。既然降级时会退回演示数据，
+         页脚就必须把这件事说明白，否则用户无法判断屏幕上的数字能不能信。 -->
     <footer class="layout__footer">
-      <span class="muted">
-        数据来源：行情为公开接口，AI 研判为辅助参考。
-        <strong>本应用不构成任何投资建议。</strong>
-      </span>
+      <p class="layout__footer-line muted">
+        数据来源：行情与资讯取自第三方财经网站的内部数据接口（东方财富 / 腾讯 / 新浪），
+        <strong>未获数据方授权，亦无可用性承诺</strong>，
+        可能延迟、缺失、字段变更，或在降级时切换为内置演示数据
+        （降级时页面顶部有醒目提示，请以该提示为准）。
+      </p>
+      <p class="layout__footer-line muted">
+        AI 研判由大模型生成，仅作辅助参考，可能出错。
+        <strong>本应用不构成任何投资建议，据此操作风险自担。</strong>
+      </p>
     </footer>
   </div>
 </template>
@@ -283,5 +316,16 @@ onMounted(() => {
   padding: 20px 16px 32px;
   width: 100%;
   font-size: 12px;
+}
+
+/* 页脚现在有两段：段间留 6px，最后一段不留底边距，
+   否则会在 padding 之外多出一截空白 */
+.layout__footer-line {
+  margin: 0 0 6px;
+  line-height: 1.7;
+}
+
+.layout__footer-line:last-child {
+  margin-bottom: 0;
 }
 </style>

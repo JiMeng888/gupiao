@@ -84,6 +84,30 @@ public class MockMarketDataProvider implements MarketDataProvider {
         return "mock";
     }
 
+    /**
+     * 拒绝作为降级源提供榜单数据。
+     *
+     * <p>本实现仍然<b>完整支持</b> {@link #getTopMovers}（离线模式
+     * {@code provider=mock} 下界面要能正常演示，见
+     * {@code MockMarketDataProviderMoversTest}），但<b>不接受在降级路径上</b>
+     * 用它——这两种场合的区别很重要：
+     * <ul>
+     *   <li><b>显式离线模式</b>：用户主动配置只用演示数据，页面顶部没有
+     *       降级横幅，整个界面的语义就是「这是演示」。此时榜单是演示的
+     *       一部分，保留它才有完整的产品形态。</li>
+     *   <li><b>降级路径</b>：真实源故障，用户以为自己看的是真实行情。
+     *       此时返回一个「由 10 只固定股票的随机涨跌幅排出来的名次」
+     *       会造成实际误导——名次本身携带「第 1 名值得关注」的判断。</li>
+     * </ul>
+     *
+     * <p>于是这一项返回「暂不可用」，由前端明确告知用户，而不是给一个
+     * 看起来合理的假榜单。
+     */
+    @Override
+    public boolean acceptableAsFallback(String action) {
+        return !"getTopMovers".equals(action);
+    }
+
     @Override
     public Quote getQuote(String code) {
         StockCodes.ParsedCode parsed = requireParsed(code);

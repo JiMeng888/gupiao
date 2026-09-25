@@ -9,9 +9,12 @@
 #   docker compose up -d --build
 #   浏览器打开 http://localhost:8088
 #
-# 首次启动后端的 sql.init.mode 是 never，所以数据库表需要先建好，
-# 建表语句在 backend/src/main/resources/db/schema-mysql.sql。
-# 下面 db-init 这个一次性服务负责这件事。
+# 首次启动时**不需要手工建表**：后端启动即由 Flyway 执行
+# backend/src/main/resources/db/migration/mysql/ 下的版本化迁移。
+#   - 全新数据卷          → 执行 V1 建表
+#   - 已有表的旧数据卷    → 打基线跳过 V1，**已有数据原样保留**
+# 详见 backend/src/main/resources/application.yml 的 spring.flyway 段。
+# 升级既有部署只需 docker compose up -d --build，不必清库。
 # ---------------------------------------------------------------------------
 
 services:
@@ -45,32 +48,18 @@ services:
     networks: [stocklab]
 
   # ---------------------------------------------------------------------------
-  # 一次性建表服务。
+  # 说明：这里原本有一个 db-init 一次性容器负责建表。
+  # 引入 Flyway 后已移除——因为「建表」这件事必须只有一个归属：
+  # 两套机制并存时，db-init 会把表建出来、Flyway 只看到「结构非空」而打基线，
+  # 结果是**谁都没有真正管过结构演进**，正是引入迁移工具想消灭的那种状态。
   #
-  # 不用 spring.sql.init 的原因：那要求应用账号具备 DDL 权限，
-  # 而生产上应用账号应当只有 DML 权限（见 schema-mysql.sql 末尾的说明）。
-  # 交给一个一次性容器执行，应用账号就没有建表能力。
+  # 代价是应用账号现在需要 DDL 权限（Flyway 要建 flyway_schema_history 表
+  # 并执行迁移）。若环境不允许，用 spring.flyway.user / spring.flyway.password
+  # 指定独立的迁移账号，应用主连接仍保持只有 DML。
+  #
+  # 库本身由下面 mysql 服务的 MYSQL_DATABASE 创建（字符集取自
+  # --character-set-server=utf8mb4），Flyway 不建库。
   # ---------------------------------------------------------------------------
-  db-init:
-    image: mysql:8.0
-    container_name: stocklab-db-init
-    depends_on:
-      mysql:
-        condition: service_healthy
-    environment:
-      MYSQL_PWD: ${MYSQL_ROOT_PASSWORD}
-    volumes:
-      - ../backend/src/main/resources/db/schema-mysql.sql:/schema.sql:ro
-    # IF NOT EXISTS 语义由脚本内的建表语句保证，重复执行是安全的。
-    #
-    # 为什么带重试循环：MySQL 8 官方镜像首次启动会先起「临时 server」做初始化
-    # （建库、设 root 密码），完成后 shutdown 再正式启动。healthcheck 的
-    # mysqladmin ping 在临时 server 阶段就返回成功，导致 depends_on 过早放行，
-    # 此时真 server 还在重启，直连会 Can't connect (111)。所以这里连不上时
-    # 退避重试，而不是一次失败就退出。
-    entrypoint: ["sh", "-c", "for i in $$(seq 1 30); do if mysql -h mysql -uroot stocklab < /schema.sql; then echo '建表完成'; exit 0; fi; echo \"第 $$i 次连接失败，2 秒后重试...\"; sleep 2; done; echo '建表失败：多次重试仍连不上 MySQL'; exit 1"]
-    restart: "no"
-    networks: [stocklab]
 
   redis:
     image: redis:7-alpine
@@ -96,16 +85,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      # 等建表完成再启动，避免启动瞬间查不到表
-      db-init:
-        condition: service_completed_successfully
     environment:
       SPRING_PROFILES_ACTIVE: mysql
       TZ: Asia/Shanghai
 
       # 数据库。后端读的是完整 JDBC URL（application-mysql.yml 的 ${DB_URL}），
       # 不是拆开的 DB_HOST/DB_PORT/DB_NAME——那三个变量后端根本不读。
-      # 库名用 stocklab（与 MYSQL_DATABASE、db-init 的目标库一致）。
+      # 库名用 stocklab（与上面 mysql 服务的 MYSQL_DATABASE 一致）。
       DB_URL: jdbc:mysql://mysql:3306/stocklab?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true
       DB_USERNAME: ${DB_USERNAME:-root}
       DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}

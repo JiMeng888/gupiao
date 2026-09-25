@@ -1,10 +1,26 @@
 -- ============================================================================
--- 股票分析师系统 · MySQL 8 建表脚本
+-- V1 · MySQL 8 结构基线
 --
--- 使用方式（数据库需先手动创建，见文件末尾）：
---   mysql -u<user> -p < schema-mysql.sql
+-- 【本文件的角色】
+-- 这是「项目已有的表结构」的快照，由 Flyway 管理，**不要修改它**——
+-- 迁移脚本一旦被执行过就会被记录 checksum，任何改动都会让
+-- 后续 migrate 直接失败（这是刻意的：静默跳过被改过的迁移会让
+-- 「开发机是新的、生产库是旧的」长期潜伏）。
+-- 需要改结构请新增 V2__xxx.sql。
 --
--- 设计约定：
+-- 【它会在什么情况下被执行】
+--   * 全新的空库            → 执行本脚本建表
+--   * 已有表的旧库（无 flyway_schema_history）
+--                          → 被打上「基线」标记，本脚本**跳过**，
+--                            既有表与数据原样保留（见 application.yml 的
+--                            baseline-on-migrate / baseline-version）
+-- 因此本脚本同时可以当作「人工建库脚本」直接执行：
+--   mysql -u<user> -p <stocklab> < V1__baseline.sql
+-- 所有建表语句都是 IF NOT EXISTS，重复执行安全。
+--   （各 profile 的迁移脚本按数据库厂商分目录：db/migration/mysql 与
+--    db/migration/h2，DDL 方言不同必须分开维护。）
+--
+-- 【设计约定】
 --   1. 主键统一为 VARCHAR(36) 的 UUID 字符串，由应用侧生成。
 --      不用自增整数是为了让「自选股条目 ID」这类标识出现在 URL 里时
 --      不泄漏业务规模，也便于将来做多库合并/数据迁移。
@@ -108,23 +124,35 @@ CREATE TABLE IF NOT EXISTS holdings (
   COMMENT = '持仓（每只股票一行，加权平均成本法）';
 
 -- ============================================================================
--- 首次部署提示
+-- 部署提示
 --
--- 1) 创建库（脚本本身不建库，避免误删既有同名库）：
---      CREATE DATABASE stock_analyst
+-- 1) 创建库（迁移脚本不建库，避免误删既有同名库）：
+--      CREATE DATABASE stocklab
 --        DEFAULT CHARACTER SET utf8mb4
 --        DEFAULT COLLATE utf8mb4_0900_ai_ci;
+--    库名可以是任意合法名称，只要 DB_URL 里的库名与之一致即可。
+--    deploy/docker-compose.yml 用 MYSQL_DATABASE 建的是 stocklab。
 --
--- 2) 建议单独建一个只对本库有权限的应用账号，不要用 root：
+-- 2) 应用账号的权限。注意与引入 Flyway 之前的口径差别：
+--    以前建表由人工执行，所以应用账号**只给 DML** 就够（最小权限）。
+--    现在结构演进由应用启动时的 Flyway 完成，因此应用账号需要 DDL 权限：
 --      CREATE USER 'stockapp'@'%' IDENTIFIED BY '<强密码>';
---      GRANT SELECT, INSERT, UPDATE, DELETE ON stock_analyst.* TO 'stockapp'@'%';
+--      GRANT SELECT, INSERT, UPDATE, DELETE,
+--            CREATE, ALTER, INDEX, DROP, REFERENCES
+--        ON stocklab.* TO 'stockapp'@'%';
 --      FLUSH PRIVILEGES;
---    （DDL 权限没有授予——建表由本脚本手工执行，应用只做 DML。）
+--    若所在环境不允许应用持有 DDL 权限，用 spring.flyway.user /
+--    spring.flyway.password 指定一个独立的迁移账号（见 application.yml），
+--    应用主连接仍保持只有 DML。
 --
 -- 3) 应用侧配置（环境变量，不要写进配置文件）：
 --      SPRING_PROFILES_ACTIVE=mysql
---      DB_URL=jdbc:mysql://localhost:3306/stock_analyst?useUnicode=true&characterEncoding=utf8mb4&serverTimezone=Asia/Shanghai
+--      DB_URL=jdbc:mysql://localhost:3306/stocklab?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
 --      DB_USERNAME=stockapp
 --      DB_PASSWORD=<强密码>
 --      APP_JWT_SECRET=<至少 32 字符的随机串>
+--
+-- 4) 查看当前库的结构版本：
+--      SELECT version, description, success, installed_on
+--        FROM flyway_schema_history ORDER BY installed_rank;
 -- ============================================================================

@@ -71,6 +71,41 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- ============ 数据库迁移 ============ -->
+        <!--
+          为什么必须引入迁移工具：
+          原方案用 `CREATE TABLE IF NOT EXISTS` 手工建表，这套语句只会「补建缺失的表」，
+          对**已存在**的表一个字段都不会加，却会在下次给实体加字段时正常退出、
+          打印「建表完成」。故障于是推迟到运行时，以 `Unknown column` 的形式爆发，
+          而排查起点是一个「说成功了的」部署脚本。
+
+          Flyway 把结构演进变成版本化迁移：只增不改、逐版本校验 checksum、
+          执行历史落在 flyway_schema_history 表里，因此「生产库到底是哪个版本」
+          变成可查询的事实。
+
+          【必须用 starter，不能只写 flyway-core】Spring Boot 4 把各技术的自动配置
+          拆成了独立模块（spring-boot-jdbc / spring-boot-flyway …），
+          `FlywayAutoConfiguration` 在 `spring-boot-flyway` 里，不在 flyway-core 里。
+          只加 flyway-core 的后果很有迷惑性：**编译通过、启动成功、日志无异常，
+          但迁移一次都不执行**，表现为「表根本没建出来」。
+          （这个坑实际踩过：加 flyway-core 后应用正常启动，注册接口却报
+           服务器内部错误，因为 users 表压根不存在。）
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-flyway</artifactId>
+        </dependency>
+        <!--
+          MySQL 支持是 Flyway 10 起拆出的独立模块，不在核心包里。
+          缺了它的表现同样是「能启动但不迁移」（日志会提示当前数据库不受支持）。
+          H2 无需额外模块，其支持仍在核心包中（对照 BOM 的 flyway-database-* 清单，
+          h2 不在其中，hsqldb / derby / db2 等才是）。
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-mysql</artifactId>
+        </dependency>
+
         <!-- ============ 缓存 / 会话 ============ -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

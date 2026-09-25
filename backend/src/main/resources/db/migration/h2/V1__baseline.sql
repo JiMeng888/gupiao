@@ -1,21 +1,25 @@
 -- ============================================================================
--- 股票分析师系统 · H2 开发库建表脚本
+-- V1 · H2 开发库结构基线
 --
--- 用途：本地开发与演示。默认 profile 为 dev，应用启动时自动执行本脚本。
---       H2 使用内存库，进程退出即清空——每次重启都是一份干净的初始数据。
+-- 【本文件的角色】
+-- 与 db/migration/mysql/V1__baseline.sql 等价，只是 H2 方言。两者必须
+-- **结构等价**：字段 / 类型 / 约束一一对应，否则「开发机跑得好、生产上
+-- 报错」这类问题会重新出现，而迁移工具的存在意义正是消除它。
+-- 修改结构请新增 V2__xxx.sql，不要改本文件（checksum 会被 Flyway 校验）。
 --
--- 与 MySQL 版本的差异（schema-mysql.sql）：
---   * 无 ENGINE / CHARSET 子句
+-- 【与 MySQL 版本的差异】
+--   * 无 ENGINE / CHARSET / COLLATE 子句（H2 不支持）
+--   * 索引必须用独立的 CREATE INDEX（H2 不支持建表语句里的 KEY 子句）
+--   * 唯一约束用 CONSTRAINT ... UNIQUE 内联写法
 --   * 时间字段用 BIGINT（epoch 秒），两边一致，避免时区与驱动差异
 --   * 不使用 AUTO_INCREMENT（主键为 UUID 字符串，由应用生成）
+--
+-- 【为什么没有 DROP TABLE】
+-- 原脚本以「先 DROP 再 CREATE」开头，在当时是合理的（应用启动时执行，
+-- 保证重复启动结构一致）。但作为**迁移脚本**这个写法是危险的：
+-- 它会在任何一次「意外重跑」中删掉全部数据。H2 是内存库、每次启动
+-- 都是空库，本来也没有残留需要清理，因此这里去掉 DROP。
 -- ============================================================================
-
--- 先删后建，保证重复启动时结构一致（H2 内存库一般无残留，但显式写更稳）
-DROP TABLE IF EXISTS holdings;
-DROP TABLE IF EXISTS ai_reports;
-DROP TABLE IF EXISTS watchlist_items;
-DROP TABLE IF EXISTS watchlist_groups;
-DROP TABLE IF EXISTS users;
 
 -- ---------------------------------------------------------------------------
 -- 用户
@@ -92,18 +96,18 @@ CREATE INDEX idx_ai_report_code_created ON ai_reports (code, created_at);
 -- 持仓
 -- ---------------------------------------------------------------------------
 CREATE TABLE holdings (
-    id         VARCHAR(36)   NOT NULL,
-    user_id    VARCHAR(36)   NOT NULL,
-    code       VARCHAR(12)   NOT NULL,
+    id         VARCHAR(36)    NOT NULL,
+    user_id    VARCHAR(36)    NOT NULL,
+    code       VARCHAR(12)    NOT NULL,
     name       VARCHAR(50),
     -- 股数。不存金额，市值由「股数 × 行情」实时计算
-    shares     INT           NOT NULL DEFAULT 0,
+    shares     INT            NOT NULL DEFAULT 0,
     -- 加权平均成本，保留 4 位小数
     avg_cost   DECIMAL(18, 4) NOT NULL DEFAULT 0,
     -- 买入日期（YYYY-MM-DD），用户记账口径，可补录历史
     buy_date   VARCHAR(10),
-    created_at BIGINT        NOT NULL,
-    updated_at BIGINT        NOT NULL,
+    created_at BIGINT         NOT NULL,
+    updated_at BIGINT         NOT NULL,
     PRIMARY KEY (id),
     -- 每只股票一行。这个约束是「并发首次买入」正确性的必要条件，
     -- 详见 HoldingService#insertNewHolding 的说明

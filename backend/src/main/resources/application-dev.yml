@@ -18,12 +18,14 @@ spring:
     username: sa
     password: ""
 
+  # 建表不再由 spring.sql.init 负责，已统一交给 Flyway
+  # （见 application.yml 的 spring.flyway）。H2 与 MySQL 现在共用同一套
+  # 版本化迁移机制，只是脚本目录按厂商分开：db/migration/h2 与
+  # db/migration/mysql。这样「给实体加字段」在开发库和生产库走的是
+  # 同一条路径，不会出现「开发机上加过了、生产上忘了」。
   sql:
     init:
-      # always：显式声明，不依赖「嵌入式数据库才初始化」的隐式规则
-      mode: always
-      schema-locations: classpath:db/schema-h2.sql
-      continue-on-error: false
+      mode: never
 
   h2:
     console:

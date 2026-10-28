@@ -2,23 +2,21 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Star, MagicStick, Wallet } from '@element-plus/icons-vue'
-import type { EChartsOption } from 'echarts'
-import BaseChart from '@/components/BaseChart.vue'
-import ChangeText from '@/components/ChangeText.vue'
+import AiInsightCard from '@/components/AiInsightCard.vue'
+import QuoteHeader from '@/components/QuoteHeader.vue'
+import StockChart from '@/components/StockChart.vue'
 import TradeDialog from '@/components/TradeDialog.vue'
 import { fundamentalApi, indicatorApi, quoteApi, watchlistApi } from '@/api/endpoints'
 import { useAuthStore } from '@/stores/auth'
 import { useQuoteSocketStore } from '@/stores/quoteSocket'
 import type {
-  Bar,
   DupontAnalysis,
   FundamentalOverview,
   IndicatorResponse,
   Quote,
+  QuoteSnapshot,
 } from '@/api/types'
-import { formatEpochSeconds } from '@/api/types'
-import { formatMoney, formatNumber, formatVolume } from '@/utils/format'
+import { formatNumber } from '@/utils/format'
 
 /**
  * 个股详情。
@@ -35,47 +33,57 @@ const auth = useAuthStore()
 const socket = useQuoteSocketStore()
 
 const quote = ref<Quote | null>(null)
-const bars = ref<Bar[]>([])
 const indicators = ref<IndicatorResponse | null>(null)
 const overview = ref<FundamentalOverview | null>(null)
 const dupont = ref<DupontAnalysis | null>(null)
 
 const loadingQuote = ref(false)
-const loadingBars = ref(false)
 const loadingIndicator = ref(false)
 const loadingFundamental = ref(false)
 const loadError = ref<string | null>(null)
 
+/**
+ * K 线周期。只在这里持有「当前值」，取数由 {@code StockChart} 自己完成——
+ * 图表组件内部才知道每个周期要多少根、走不走分时形态，
+ * 让页面代管这些参数会让两边各维护一份口径。
+ */
 const period = ref('daily')
-const activeIndicator = ref<'MACD' | 'RSI' | 'BOLL' | 'KDJ'>('MACD')
 
 const tradeVisible = ref(false)
 const tradeMode = ref<'buy' | 'sell'>('buy')
 
-const PERIODS = [
-  { label: '日K', value: 'daily' },
-  { label: '周K', value: 'weekly' },
-  { label: '月K', value: 'monthly' },
-  { label: '60分', value: '60min' },
-  { label: '30分', value: '30min' },
-  { label: '15分', value: '15min' },
-  { label: '5分', value: '5min' },
-  { label: '分时', value: 'trend' },
-]
-
-/**
- * 优先用 WebSocket 推送的最新价，推送还没到时回退到 REST 报价。
- * 两个数据源的字段结构一致，可以无缝替换。
- */
+/** WebSocket 推送的最新快照；没推送时为 null。 */
 const live = computed(() => socket.quotes[props.code] ?? null)
 
-const displayName = computed(() => live.value?.name ?? quote.value?.name ?? '--')
-const displayPrice = computed(() => live.value?.price ?? quote.value?.price ?? null)
-const displayChange = computed(() => live.value?.change ?? quote.value?.change ?? null)
-const displayChangePct = computed(() => live.value?.changePct ?? quote.value?.changePct ?? null)
-const displayTs = computed(() => live.value?.ts ?? quote.value?.ts ?? null)
+/**
+ * 展示用报价：有实时推送时优先用推送值。
+ *
+ * <p>这里做<b>字段级回退</b>而不是整体替换：推送包里只带价格相关的几个字段，
+ * 像「今开 / 最高 / 最低 / 总市值」这些它不给，
+ * 整体替换会让这些格子变成 --；逐字段取才能保证既有实时性又不丢静态字段。
+ */
+const mergedQuote = computed<QuoteSnapshot | null>(() => {
+  const rest = quote.value
+  const push = live.value
+  if (!rest) return push
+  if (!push) return rest
+  return {
+    ...rest,
+    name: push.name || rest.name,
+    price: push.price,
+    change: push.change,
+    changePct: push.changePct,
+    volume: push.volume,
+    // 推送帧的 amount 可为 null（上游未给成交额），此时保留 REST 侧的值，
+    // 而不是填 0——「成交额 0」是错误信息，会让人以为当天没有成交
+    amount: push.amount ?? rest.amount,
+    ts: push.ts,
+  }
+})
 
-const hasIndicator = computed(() => indicators.value !== null)
+function goAnalysis(): void {
+  router.push({ name: 'analysis-detail', params: { code: props.code } })
+}
 
 onMounted(() => {
   void loadAll()
@@ -89,12 +97,7 @@ watch(
 
 async function loadAll(): Promise<void> {
   loadError.value = null
-  await Promise.allSettled([
-    loadQuote(),
-    loadBars(),
-    loadIndicators(),
-    loadFundamental(),
-  ])
+  await Promise.allSettled([loadQuote(), loadIndicators(), loadFundamental()])
   subscribeLive()
 }
 
@@ -114,18 +117,6 @@ async function loadQuote(): Promise<void> {
     loadError.value = e instanceof Error ? e.message : '报价加载失败'
   } finally {
     loadingQuote.value = false
-  }
-}
-
-async function loadBars(): Promise<void> {
-  loadingBars.value = true
-  try {
-    bars.value = await quoteApi.bars(props.code, { period: period.value, limit: 180 })
-  } catch (e) {
-    bars.value = []
-    loadError.value = e instanceof Error ? e.message : 'K 线加载失败'
-  } finally {
-    loadingBars.value = false
   }
 }
 
@@ -154,10 +145,6 @@ async function loadFundamental(): Promise<void> {
   }
 }
 
-async function onPeriodChange(): Promise<void> {
-  await loadBars()
-}
-
 async function addToWatchlist(): Promise<void> {
   if (!auth.isLoggedIn) {
     ElMessage.info('请先登录后再添加自选')
@@ -182,167 +169,7 @@ function openTrade(mode: 'buy' | 'sell'): void {
   tradeVisible.value = true
 }
 
-// ---------------------------------------------------------------------------
-// 图表配置
-// ---------------------------------------------------------------------------
-
-const UP_COLOR = '#d92b2b'
-const DOWN_COLOR = '#0a9e5c'
-
-const dates = computed(() => bars.value.map((b) => b.date))
-
-/**
- * K 线图。
- *
- * <b>颜色约定</b>：A 股是「阳线红、阴线绿」，与欧美相反。
- * ECharts 的 candlestick 默认恰好是红涨，但仍显式写死颜色：
- * 依赖默认值的话，将来换主题或升级版本时可能悄悄反转，
- * 而这类错误在图上「看起来完全正常」。
- *
- * 数据顺序是 [open, close, low, high] —— 不是 OHLC，是 OCLH。
- * 写反了图形会整体失真，且不一定报错。
- */
-const klineOption = computed<EChartsOption>(() => {
-  const ma = indicators.value?.ma
-  const series: EChartsOption['series'] = [
-    {
-      name: 'K线',
-      type: 'candlestick',
-      data: bars.value.map((b) => [b.open, b.close, b.low, b.high]),
-      itemStyle: {
-        color: UP_COLOR,
-        color0: DOWN_COLOR,
-        borderColor: UP_COLOR,
-        borderColor0: DOWN_COLOR,
-      },
-    },
-  ]
-
-  if (ma) {
-    const maDefs: Array<[string, number[] | undefined, string]> = [
-      ['MA5', ma.ma5, '#e6a23c'],
-      ['MA10', ma.ma10, '#409eff'],
-      ['MA20', ma.ma20, '#9b59b6'],
-      ['MA60', ma.ma60, '#606266'],
-    ]
-    for (const [name, data, color] of maDefs) {
-      if (!data?.length) continue
-      series.push({
-        name,
-        type: 'line',
-        data,
-        smooth: true,
-        showSymbol: false,
-        lineStyle: { width: 1, color },
-        itemStyle: { color },
-      })
-    }
-  }
-
-  return {
-    animation: false,
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
-    legend: { top: 0, data: ['K线', 'MA5', 'MA10', 'MA20', 'MA60'] },
-    grid: { left: 56, right: 20, top: 36, bottom: 48 },
-    xAxis: {
-      type: 'category',
-      data: dates.value,
-      boundaryGap: true,
-      axisLine: { lineStyle: { color: '#dcdfe6' } },
-    },
-    yAxis: {
-      type: 'value',
-      // scale: true —— 股价波动区间往往远小于 0 到最高价，
-      // 不从 0 起算才能看出真实形态
-      scale: true,
-      splitLine: { lineStyle: { color: '#f0f2f5' } },
-    },
-    dataZoom: [
-      { type: 'inside', start: 60, end: 100 },
-      { type: 'slider', height: 18, bottom: 8, start: 60, end: 100 },
-    ],
-    series,
-  }
-})
-
-/** 副图指标。三个分支的 series 数量不同，所以每次都是全量替换（notMerge）。 */
-const indicatorOption = computed<EChartsOption>(() => {
-  const ind = indicators.value
-  const base: EChartsOption = {
-    animation: false,
-    tooltip: { trigger: 'axis' },
-    grid: { left: 56, right: 20, top: 30, bottom: 40 },
-    xAxis: {
-      type: 'category',
-      data: dates.value,
-      axisLine: { lineStyle: { color: '#dcdfe6' } },
-    },
-    yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#f0f2f5' } } },
-  }
-
-  if (!ind) return base
-
-  if (activeIndicator.value === 'MACD' && ind.macd) {
-    return {
-      ...base,
-      legend: { top: 0, data: ['DIF', 'DEA', 'MACD'] },
-      series: [
-        { name: 'DIF', type: 'line', data: ind.macd.dif, showSymbol: false, lineStyle: { width: 1 } },
-        { name: 'DEA', type: 'line', data: ind.macd.dea, showSymbol: false, lineStyle: { width: 1 } },
-        {
-          name: 'MACD',
-          type: 'bar',
-          // 柱状图也遵循涨跌色：正值红、负值绿。
-          // 这里用「逐项 itemStyle」而不是 series.itemStyle.color 回调：
-          // ECharts 的 CallbackDataParams.value 是联合类型
-          // （string | number | Date | OptionDataValue[] | ... | null | undefined），
-          // 写成 (params: { value: number }) => ... 会因参数逆变检查而报 TS2769。
-          // 逐项指定既规避了这个类型坑，意图也更直白。
-          data: ind.macd.macd.map((v) => ({
-            value: v,
-            itemStyle: { color: v >= 0 ? UP_COLOR : DOWN_COLOR },
-          })),
-        },
-      ],
-    }
-  }
-
-  if (activeIndicator.value === 'RSI' && ind.rsi) {
-    return {
-      ...base,
-      legend: { top: 0, data: ['RSI'] },
-      series: [{ name: 'RSI', type: 'line', data: ind.rsi, showSymbol: false, lineStyle: { width: 1.5 } }],
-    }
-  }
-
-  if (activeIndicator.value === 'BOLL' && ind.boll) {
-    return {
-      ...base,
-      legend: { top: 0, data: ['上轨', '中轨', '下轨'] },
-      series: [
-        { name: '上轨', type: 'line', data: ind.boll.upper, showSymbol: false, lineStyle: { width: 1 } },
-        { name: '中轨', type: 'line', data: ind.boll.mid, showSymbol: false, lineStyle: { width: 1.5 } },
-        { name: '下轨', type: 'line', data: ind.boll.lower, showSymbol: false, lineStyle: { width: 1 } },
-      ],
-    }
-  }
-
-  if (activeIndicator.value === 'KDJ' && ind.kdj) {
-    return {
-      ...base,
-      legend: { top: 0, data: ['K', 'D', 'J'] },
-      series: [
-        { name: 'K', type: 'line', data: ind.kdj.k, showSymbol: false, lineStyle: { width: 1 } },
-        { name: 'D', type: 'line', data: ind.kdj.d, showSymbol: false, lineStyle: { width: 1 } },
-        { name: 'J', type: 'line', data: ind.kdj.j, showSymbol: false, lineStyle: { width: 1 } },
-      ],
-    }
-  }
-
-  return base
-})
-
-/** MACD 柱状的 color 回调参数类型在 ECharts 里是联合类型，这里放宽以便使用。 */
+/** 把指标信号对象摊平成可遍历的标签列表，空信号过滤掉。 */
 const signalEntries = computed(() => {
   const s = indicators.value?.signals
   if (!s) return []
@@ -361,98 +188,54 @@ const signalEntries = computed(() => {
 
 <template>
   <div class="page">
-    <!-- 报价头部 -->
-    <section class="card quote-head">
-      <div class="quote-head__left">
-        <div class="quote-head__title">
-          <h2>{{ displayName }}</h2>
-          <span class="mono muted">{{ props.code }}</span>
-          <el-tag v-if="live" type="success" size="small" effect="plain">实时</el-tag>
-        </div>
-        <div class="quote-head__price">
-          <ChangeText :value="displayPrice" :show-plus="false" :digits="2" class="big" />
-          <ChangeText :value="displayChange" />
-          <ChangeText :value="displayChangePct" suffix="%" />
-          <span class="muted" style="font-size: 12px">
-            更新于 {{ formatEpochSeconds(displayTs) }}
-          </span>
-        </div>
-      </div>
+    <!--
+      报价头部（M1）。延迟标注、总市值、市盈率 TTM 都收在这个组件里：
+      合规要求「延迟时长必须显示在价格附近」，所以这些标签不能挪到别处。
+      quote 传入的是合并了 WebSocket 推送后的展示值，见 mergedQuote。
+    -->
+    <QuoteHeader
+      :code="props.code"
+      :quote="mergedQuote"
+      :overview="overview"
+      :live="live !== null"
+      @add-watchlist="addToWatchlist"
+      @trade="openTrade"
+      @analysis="goAnalysis"
+    />
 
-      <div class="quote-head__actions">
-        <el-button :icon="Star" @click="addToWatchlist">加自选</el-button>
-        <el-button :icon="Wallet" @click="openTrade('buy')">记买入</el-button>
-        <el-button :icon="Wallet" @click="openTrade('sell')">记卖出</el-button>
-        <el-button
-          type="primary"
-          :icon="MagicStick"
-          @click="router.push({ name: 'analysis-detail', params: { code: props.code } })"
-        >
-          AI 研判
-        </el-button>
-      </div>
+    <el-alert
+      v-if="loadError"
+      type="error"
+      :title="loadError"
+      show-icon
+      :closable="false"
+    />
 
-      <div class="quote-head__stats">
-        <div><span class="muted">今开</span> <span class="num">{{ formatNumber(quote?.open) }}</span></div>
-        <div><span class="muted">最高</span> <span class="num">{{ formatNumber(quote?.high) }}</span></div>
-        <div><span class="muted">最低</span> <span class="num">{{ formatNumber(quote?.low) }}</span></div>
-        <div><span class="muted">昨收</span> <span class="num">{{ formatNumber(quote?.prevClose) }}</span></div>
-        <div><span class="muted">换手率</span> <span class="num">{{ formatNumber(quote?.turnover) }}%</span></div>
-        <div><span class="muted">成交量</span> <span class="num">{{ formatVolume(quote?.volume) }}</span></div>
-        <div><span class="muted">成交额</span> <span class="num">{{ formatMoney(quote?.amount) }}</span></div>
-      </div>
-
-      <el-alert
-        v-if="loadError"
-        type="error"
-        :title="loadError"
-        show-icon
-        :closable="false"
-        style="margin-top: 12px"
-      />
-    </section>
-
-    <!-- K 线 -->
+    <!--
+      K 线 + 成交量 + 指标：三 pane 联动（M2）。
+      周期与指标状态都由图表组件自己持有，页面不再代管。
+    -->
     <section class="card">
       <div class="card__header">
-        <span class="card__title">K 线（含均线）</span>
-        <el-radio-group v-model="period" size="small" @change="onPeriodChange">
-          <el-radio-button v-for="p in PERIODS" :key="p.value" :value="p.value">
-            {{ p.label }}
-          </el-radio-button>
-        </el-radio-group>
+        <span class="card__title">行情走势</span>
       </div>
       <div class="card__body">
-        <BaseChart
-          :option="klineOption"
-          :height="380"
-          :loading="loadingBars"
-          :is-empty="!bars.length && !loadingBars"
-          empty-text="该周期暂无 K 线数据"
+        <StockChart
+          :code="props.code"
+          :period="period"
+          :indicators="indicators"
+          :height="440"
+          @update:period="period = $event"
         />
       </div>
     </section>
 
-    <!-- 技术指标 -->
+    <!-- 技术指标信号 -->
     <section class="card">
       <div class="card__header">
-        <span class="card__title">技术指标</span>
-        <el-radio-group v-model="activeIndicator" size="small">
-          <el-radio-button value="MACD">MACD</el-radio-button>
-          <el-radio-button value="RSI">RSI</el-radio-button>
-          <el-radio-button value="BOLL">BOLL</el-radio-button>
-          <el-radio-button value="KDJ">KDJ</el-radio-button>
-        </el-radio-group>
+        <span class="card__title">技术信号</span>
       </div>
       <div class="card__body">
-        <BaseChart
-          :option="indicatorOption"
-          :height="260"
-          :loading="loadingIndicator"
-          :is-empty="!hasIndicator && !loadingIndicator"
-          empty-text="指标数据不可用"
-        />
-
         <div v-if="signalEntries.length" class="signals">
           <el-tag
             v-for="s in signalEntries"
@@ -466,8 +249,16 @@ const signalEntries = computed(() => {
             {{ s.text }}
           </el-tag>
         </div>
+        <p v-else class="muted" style="margin: 0">当前无可用技术信号</p>
       </div>
     </section>
+
+    <!--
+      AI 解读卡（M3）。
+      放在技术信号之后：用户先看到客观的量价与指标，再看 AI 的主观解读，
+      顺序反过来会让 AI 的结论先入为主地影响对图形的判读。
+    -->
+    <AiInsightCard :code="props.code" :name="mergedQuote?.name ?? ''" />
 
     <!-- 基本面 -->
     <section class="card">
@@ -571,7 +362,13 @@ const signalEntries = computed(() => {
       </div>
     </section>
 
-    <TradeDialog v-model="tradeVisible" :mode="tradeMode" :code="props.code" :name="displayName" @done="loadAll" />
+    <TradeDialog
+      v-model="tradeVisible"
+      :mode="tradeMode"
+      :code="props.code"
+      :name="mergedQuote?.name ?? ''"
+      @done="loadAll"
+    />
   </div>
 </template>
 
@@ -630,7 +427,7 @@ const signalEntries = computed(() => {
 
 .metric {
   padding: 10px 12px;
-  background: #fafbfc;
+  background: var(--color-surface-muted);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
 }

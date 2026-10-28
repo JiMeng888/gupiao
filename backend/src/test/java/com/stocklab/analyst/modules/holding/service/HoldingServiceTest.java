@@ -462,6 +462,36 @@ class HoldingServiceTest {
             assertThat(summary.pnlPct()).as("分母只应含参与统计的成本")
                     .isCloseTo(10.0, within(1e-9));
         }
+
+        @Test
+        @DisplayName("昨收缺失（上游填 0）时当日盈亏为 null，不被放大成「股数 × 现价」")
+        void dayPnlIsNullWhenPrevCloseMissing() {
+            when(holdingMapper.selectList(any())).thenReturn(List.of(holding(1000, 10.0)));
+            when(marketDataProvider.getQuote(CODE)).thenReturn(quote("12", "0"));
+
+            HoldingView view = service.listHoldings(USER).get(0);
+
+            assertThat(view.dayPnl())
+                    .as("昨收为 0 是「缺失」的哨兵值，不是真实价格，代公式会凭空放大两个数量级")
+                    .isNull();
+            // 若照算：1000 × (12 − 0) = 12000，而真实当日盈亏本该是几百元量级
+            assertThat(view.marketValue()).isCloseTo(12000.0, within(1e-9));
+        }
+
+        @Test
+        @DisplayName("组合总览：行情整体不可用时 count 归零，但 totalCount 保留真实持仓只数")
+        void summaryKeepsTotalCountWhenAllQuotesFail() {
+            when(holdingMapper.selectList(any())).thenReturn(List.of(holding(100, 10.0)));
+            when(marketDataProvider.getQuote(CODE)).thenThrow(new IllegalStateException("上游不可达"));
+
+            PortfolioSummary summary = service.portfolioSummary(USER);
+
+            assertThat(summary.count()).as("取不到行情的持仓不参与估值").isEqualTo(0);
+            assertThat(summary.totalCount())
+                    .as("持仓只数取决于股数而非行情，不该跟着一起归零，否则界面等同于「空仓」")
+                    .isEqualTo(1);
+            assertThat(summary.marketValue()).isCloseTo(0.0, within(1e-9));
+        }
     }
 
     // ==================================================================

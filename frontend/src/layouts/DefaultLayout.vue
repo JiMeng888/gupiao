@@ -2,12 +2,13 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Search, User, SwitchButton, Setting, Star, Wallet } from '@element-plus/icons-vue'
+import { Search, User, SwitchButton, Setting, Star, Wallet, Sunny, Moon } from '@element-plus/icons-vue'
 import SourceBadge from '@/components/SourceBadge.vue'
 import { quoteApi } from '@/api/endpoints'
 import { useAuthStore } from '@/stores/auth'
 import { useMarketSourceStore } from '@/stores/marketSource'
 import { useQuoteSocketStore } from '@/stores/quoteSocket'
+import { useThemeStore } from '@/stores/theme'
 import type { StockBrief } from '@/api/types'
 
 /**
@@ -22,8 +23,16 @@ const router = useRouter()
 const auth = useAuthStore()
 const source = useMarketSourceStore()
 const socket = useQuoteSocketStore()
+const theme = useThemeStore()
 
 const activeMenu = computed(() => route.path)
+
+/** 主题按钮图标与提示：跟随系统时用太阳图标，避免表达出错误的当前状态。 */
+const themeIcon = computed(() => (theme.isDark ? Moon : Sunny))
+const themeTooltip = computed(() => {
+  if (theme.choice === null) return '当前跟随系统主题，点击切换为亮色'
+  return theme.isDark ? '当前为暗色，点击切换为跟随系统' : '当前为亮色，点击切换为暗色'
+})
 
 /** 数据源状态复检间隔。低频是有意为之：它只需要在故障后「一个周期内」被发现。 */
 const SOURCE_REFRESH_MS = 30_000
@@ -146,6 +155,15 @@ onBeforeUnmount(() => {
             <span class="ws-dot" :class="{ 'ws-dot--on': socket.connected }" />
           </el-tooltip>
 
+          <!--
+            主题切换（M5）。三态：跟随系统 / 亮 / 暗。
+            放在顶栏而不是设置页：看盘时环境光会变（白天/夜里），
+            用户需要在不离开当前页面的前提下切换。
+          -->
+          <el-tooltip :content="themeTooltip" placement="bottom">
+            <el-button text circle :icon="themeIcon" @click="theme.cycle()" />
+          </el-tooltip>
+
           <SourceBadge />
 
           <el-dropdown v-if="auth.isLoggedIn" trigger="click">
@@ -227,7 +245,15 @@ onBeforeUnmount(() => {
   position: sticky;
   top: 0;
   z-index: 100;
-  background: var(--color-surface);
+  /*
+    半透明 + 模糊而不是实色：
+    深色下实色顶栏会和内容区连成一片，滚动时分不清哪是页头；
+    让内容从底下透出一点，边界由模糊自然产生，比加一条更粗的线干净。
+    取值在亮/暗两套变量里各自定义（--color-surface-translucent）。
+  */
+  background: var(--color-surface-translucent);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
   border-bottom: 1px solid var(--color-border);
 }
 
@@ -281,7 +307,7 @@ onBeforeUnmount(() => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #c8cdd4;
+  background: var(--color-border-strong);
   flex: none;
 }
 

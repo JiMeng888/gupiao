@@ -41,7 +41,13 @@ public enum MarketPeriod {
     WEEKLY("102"),
 
     /** 月 K。 */
-    MONTHLY("103");
+    MONTHLY("103"),
+
+    /** 季 K。 */
+    QUARTERLY("104"),
+
+    /** 年 K。 */
+    YEARLY("105");
 
     private final String upstreamCode;
 
@@ -79,6 +85,8 @@ public enum MarketPeriod {
             case "101", "daily", "day", "d", "日", "日k" -> Optional.of(DAILY);
             case "102", "weekly", "week", "w", "周", "周k" -> Optional.of(WEEKLY);
             case "103", "monthly", "month", "mo", "月", "月k" -> Optional.of(MONTHLY);
+            case "104", "quarterly", "quarter", "q", "季", "季k" -> Optional.of(QUARTERLY);
+            case "105", "yearly", "year", "y", "年", "年k" -> Optional.of(YEARLY);
             default -> Optional.empty();
         };
     }

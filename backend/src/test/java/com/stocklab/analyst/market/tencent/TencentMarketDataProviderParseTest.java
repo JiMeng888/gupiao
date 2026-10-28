@@ -276,4 +276,115 @@ class TencentMarketDataProviderParseTest {
             assertThat(indices.get(0).code()).isEqualTo("000001.SH");
         }
     }
+
+    // ==================================================================
+    @Nested
+    @DisplayName("板块榜单")
+    class SectorRanking {
+
+        /**
+         * 2026-10-21 实测 {@code proxy.finance.qq.com/cgi/cgi-bin/rank/pt/getRank}
+         * 的真实响应（只保留解析用到的字段，值未改动）。
+         *
+         * <p>顺序刻意保持上游原样——上游<b>不按涨跌幅排序</b>
+         * （这里 1.95 / 0.79 / 0.6 / -0.11 恰好是降序，但真实响应里
+         * 首条可能是 -1.65，见 {@code TencentMarketDataProvider#SECTOR_FETCH_COUNT}），
+         * 所以「排序」这条断言检验的是本类的本地排序，而不是上游的顺序。
+         */
+        private static final String SAMPLE = """
+                {
+                  "code": 0,
+                  "msg": "ok",
+                  "data": {
+                    "offset": 0,
+                    "total": 31,
+                    "rank_list": [
+                      {"code":"pt01801010","name":"农林牧渔","zdf":"1.95","zgb":"73/103",
+                       "lzg":{"code":"sh002086","name":"东方海洋","zdf":"10.14"}},
+                      {"code":"pt01801150","name":"医药生物","zdf":"-0.11","zgb":"184/480",
+                       "lzg":{"code":"sz300006","name":"莱美药业","zdf":"20.00"}},
+                      {"code":"pt01801080","name":"电子","zdf":"0.79","zgb":"237/497",
+                       "lzg":{"code":"sz300296","name":"利亚德","zdf":"20.04"}},
+                      {"code":"pt01801770","name":"通信","zdf":"0.60"}
+                    ]
+                  }
+                }
+                """;
+
+        @Test
+        @DisplayName("按涨跌幅降序排列：上游顺序不可信，排序必须自己做")
+        void sortsByChangePctDescending() throws Exception {
+            List<com.stocklab.analyst.market.model.Sector> sectors =
+                    TencentMarketDataProvider.parseSectorRank(MAPPER.readTree(SAMPLE));
+
+            assertThat(sectors).extracting(com.stocklab.analyst.market.model.Sector::name)
+                    .containsExactly("农林牧渔", "电子", "通信", "医药生物");
+        }
+
+        @Test
+        @DisplayName("涨跌家数从 \"73/103\" 解析为两个整数")
+        void parsesBreadth() throws Exception {
+            List<com.stocklab.analyst.market.model.Sector> sectors =
+                    TencentMarketDataProvider.parseSectorRank(MAPPER.readTree(SAMPLE));
+
+            assertThat(sectors.get(0).upCount()).isEqualTo(73);
+            assertThat(sectors.get(0).downCount()).isEqualTo(103);
+        }
+
+        @Test
+        @DisplayName("领涨股代码去掉市场前缀，只留 6 位")
+        void stripsLeaderMarketPrefix() throws Exception {
+            List<com.stocklab.analyst.market.model.Sector> sectors =
+                    TencentMarketDataProvider.parseSectorRank(MAPPER.readTree(SAMPLE));
+
+            assertThat(sectors.get(0).leaderName()).isEqualTo("东方海洋");
+            assertThat(sectors.get(0).leaderCode()).isEqualTo("002086");
+            assertThat(sectors.get(0).leaderPct()).isEqualTo(10.14);
+        }
+
+        @Test
+        @DisplayName("家数与领涨股缺失时给 null，不用 0 兜底")
+        void missingBreadthAndLeaderBecomeNull() throws Exception {
+            List<com.stocklab.analyst.market.model.Sector> sectors =
+                    TencentMarketDataProvider.parseSectorRank(MAPPER.readTree(SAMPLE));
+
+            com.stocklab.analyst.market.model.Sector telecom = sectors.get(2);
+            assertThat(telecom.upCount()).isNull();
+            assertThat(telecom.downCount()).isNull();
+            assertThat(telecom.leaderName()).isNull();
+            assertThat(telecom.leaderCode()).isNull();
+            assertThat(telecom.leaderPct()).isNull();
+        }
+
+        @Test
+        @DisplayName("缺涨跌幅的条目直接丢弃：放进涨幅榜会被读成「平盘」")
+        void dropsEntriesWithoutChangePct() throws Exception {
+            String withDash = """
+                    {"code":0,"data":{"rank_list":[
+                      {"code":"pt1","name":"板块甲","zdf":"-"},
+                      {"code":"pt2","name":"板块乙","zdf":"1.20","zgb":"-/-"}
+                    ]}}
+                    """;
+
+            List<com.stocklab.analyst.market.model.Sector> sectors =
+                    TencentMarketDataProvider.parseSectorRank(MAPPER.readTree(withDash));
+
+            assertThat(sectors).hasSize(1);
+            assertThat(sectors.get(0).name()).isEqualTo("板块乙");
+            // "−/−" 这类占位符同样不能变成 0：0/0 会被渲染成一个正常但无意义的比例
+            assertThat(sectors.get(0).upCount()).isNull();
+            assertThat(sectors.get(0).downCount()).isNull();
+        }
+
+        @Test
+        @DisplayName("上游拒绝服务（data 为 null）时返回空列表，由调用方决定含义")
+        void returnsEmptyOnRejectedEnvelope() throws Exception {
+            String rejected = """
+                    {"code":1619377101,"msg":"param error","data":null}
+                    """;
+
+            assertThat(TencentMarketDataProvider.parseSectorRank(MAPPER.readTree(rejected)))
+                    .isEmpty();
+        }
+    }
 }

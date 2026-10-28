@@ -4,11 +4,13 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Search, Star } from '@element-plus/icons-vue'
 import ChangeText from '@/components/ChangeText.vue'
+import SectorBoard from '@/components/SectorBoard.vue'
 import TradeDialog from '@/components/TradeDialog.vue'
 import { quoteApi, watchlistApi } from '@/api/endpoints'
 import { useAuthStore } from '@/stores/auth'
 import { useMarketSourceStore } from '@/stores/marketSource'
 import { useQuoteSocketStore } from '@/stores/quoteSocket'
+import { providerLabel, servingProvider } from '@/utils/marketSourceLabels'
 import type { IndexSnapshot, Mover, StockBrief } from '@/api/types'
 import { formatEpochSeconds } from '@/api/types'
 
@@ -59,12 +61,18 @@ const moversLoading = ref(false)
 /**
  * 榜单失败原因。
  *
- * 榜单是所有行情操作里<b>唯一</b>在降级时会被后端明确拒绝的一项
+ * 榜单与板块榜是所有行情操作里<b>仅有的</b>两项会在降级时被后端明确拒绝的
  * （演示数据不得用于排序结果，见 `MarketDataProvider#acceptableAsFallback`），
  * 所以这里拿到的 503 不是异常而是设计行为。必须把原因如实显示出来，
  * 否则用户看到空表格只会以为「今天没有涨的股票」。
  */
 const moversError = ref<string | null>(null)
+
+/** 榜单当前实际由哪个源服务（可能是备用真实源新浪，不是演示数据）。 */
+const moversSourceText = computed(() => {
+  const label = providerLabel(servingProvider(source.status, 'getTopMovers'))
+  return label ? `数据源：${label}` : null
+})
 
 async function loadMovers(): Promise<void> {
   moversLoading.value = true
@@ -184,11 +192,21 @@ function openBuy(code: string, name: string): void {
     <section class="card">
       <div class="card__header">
         <span class="card__title">市场榜单</span>
-        <el-radio-group v-model="board" size="small" @change="loadMovers">
-          <el-radio-button value="gain">涨幅榜</el-radio-button>
-          <el-radio-button value="loss">跌幅榜</el-radio-button>
-          <el-radio-button value="amount">成交额榜</el-radio-button>
-        </el-radio-group>
+        <div class="board__controls">
+          <!--
+            来源标注：榜单有自己的优先链（东财 → 新浪）。降级到新浪时
+            degraded 为 false、不弹横幅，但来源要标出来——
+            否则「榜单里的股票怎么换了一批」无从解释。
+          -->
+          <el-tag v-if="moversSourceText" size="small" type="info" effect="plain">
+            {{ moversSourceText }}
+          </el-tag>
+          <el-radio-group v-model="board" size="small" @change="loadMovers">
+            <el-radio-button value="gain">涨幅榜</el-radio-button>
+            <el-radio-button value="loss">跌幅榜</el-radio-button>
+            <el-radio-button value="amount">成交额榜</el-radio-button>
+          </el-radio-group>
+        </div>
       </div>
       <div class="card__body">
         <el-table
@@ -229,6 +247,9 @@ function openBuy(code: string, name: string): void {
         </el-table>
       </div>
     </section>
+
+    <!-- 板块榜单（M4）：个股榜看「谁在涨」，板块榜看「钱往哪去」。 -->
+    <SectorBoard :limit="10" />
 
     <section class="card">
       <div class="card__header">
@@ -350,5 +371,14 @@ function openBuy(code: string, name: string): void {
   display: flex;
   gap: 8px;
   max-width: 520px;
+}
+
+/* 卡片头右侧：来源标签 + 榜单切换。窄屏时允许换行，避免标签把按钮挤出容器 */
+.board__controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 </style>

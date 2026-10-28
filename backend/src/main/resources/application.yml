@@ -91,10 +91,43 @@ app:
     # 「内部」指各财经网站给自家网页用的接口，未获数据方授权（详见 docs/数据来源与授权状态说明-20260924.md）
     # mock：内置确定性演示数据（离线可用，无网络依赖）
     provider: ${MARKET_DATA_PROVIDER:eastmoney}
-    # 降级链（provider 非 mock 时）：eastmoney → tencent → mock。
-    # tencent（腾讯行情）是备用真实源：东财存在 IP 级风控（服务端直接断连，
-    # 实测 2026-09-19 / 2026-09-21），触发时报价/K 线/指数由腾讯继续提供真实数据；
-    # 搜索与榜单腾讯无对应能力，这两项落 mock 演示数据。
+    #
+    # 降级链的优先级顺序（provider 非 mock 时生效）。兜底源 mock 不要写在这里——
+    # 它由装配代码强制放在链尾，写进来会被忽略并打 WARN。
+    #
+    # 顺序可配的用途：东财存在 IP 级风控（服务端直接断连，实测 2026-09-19 / 09-21），
+    # 触发后把腾讯提到第一位即可让报价/K 线/指数继续走真实数据，无需改代码重新发版。
+    # 例：MARKET_DATA_CHAIN=tencent,eastmoney,tushare
+    #
+    #   各源能力差异：
+    #   eastmoney —— 字段最全（搜索 / 个股榜单 / 全市场清单都有）
+    #   tencent   —— 报价 / K 线 / 指数 / 一级行业板块榜；无搜索与个股榜单能力
+    #   sina      —— 只有个股榜单（涨跌幅榜、成交额榜），不参与主链，见下方 movers-chain
+    #   tushare   —— 有授权协议，但免费档仅日/周/月 K 线、指数、搜索；未配 TUSHARE_TOKEN 时不入链
+    chain: ${MARKET_DATA_CHAIN:eastmoney,tencent,tushare}
+    #
+    # 板块榜的独立优先链（只影响 /quote/sectors，不影响报价/K线/搜索）。
+    #
+    # 为什么单独排：两个源的板块口径不同。东财行业板块接口返回 496 个板块，
+    # 一级/二级/三级混在一起且没有层级字段——实测涨幅榜头部是「广告媒体」
+    # （3 只成分股）「其他数字媒体」（2 只），还伴随「电视广播Ⅲ / Ⅱ」
+    # 「林业Ⅲ / Ⅱ」这类同板块跨层级重复条目，对「资金往哪去」没有解释力。
+    # 腾讯返回的是 31 个一级行业，成分股规模相当，天然可比。
+    #
+    # 想把板块也交回东财，改成 MARKET_DATA_SECTOR_CHAIN=eastmoney,tencent 即可。
+    sector-chain: ${MARKET_DATA_SECTOR_CHAIN:tencent,eastmoney}
+    #
+    # 个股榜单的独立优先链（只影响 /quote/movers 的涨跌幅榜与成交额榜）。
+    #
+    # 与板块链相反，东财排在前面：这里的差异不是口径而是「有没有」。
+    # 腾讯的个股榜接口实测返回空列表（{"rank_list":[],"total":0}），
+    # 所以此前榜单只有东财一家真实源，东财一被风控，首页「今日涨幅榜」就整块
+    # 变成「市场榜单暂不可用」。新浪补上了这一级：node=hs_a 覆盖与东财
+    # 完全相同的五个板块（沪深主板/创业板/科创板/北交所），两家的上榜名单可直接互换。
+    #
+    # 新浪为什么不在 chain 里：本项目只实现了它的榜单能力，
+    # 放进主链会让每次报价/K 线降级都多走一次注定失败的调用。
+    movers-chain: ${MARKET_DATA_MOVERS_CHAIN:eastmoney,sina}
     # 单次行情请求超时。设得比页面等待时间短，宁可降级也不要挂住线程
     timeout: 6s
     # 真实源请求失败后的冷却时长：冷却期内跳过该源直接用下一级，
@@ -107,10 +140,23 @@ app:
     bar-ttl: 5m
     # 启动后异步预热全 A 股代码清单（搜索依赖它）。
     # 用 ApplicationReadyEvent 触发，不拖慢启动
-    warmup-on-boot: true
+    # 极低配机器（如 0.1 vCPU 的免费档）可设为 false 换取更轻的启动开销，
+    # 代价是搜索接口在预热完成前返回空列表
+    warmup-on-boot: ${MARKET_DATA_WARMUP_ON_BOOT:true}
     # 上游故障时降级为演示数据。开启后接口不会因上游抖动而整体不可用，
     # 但响应里会标记数据源，前端需据此提示用户
     fallback-to-mock: true
+    #
+    # 对外「声明」的行情延迟分钟数，0 表示实时。
+    #
+    # 合规要求：使用非实时行情时，必须在价格附近明示延迟时长。
+    # 本项目默认接的公开接口在交易时段返回实时价，故默认 0；
+    # 若换成明确延迟的行情源（很多免费/延迟源是 15 分钟），必须在这里改，
+    # 前端会据此在价格旁渲染「延迟 N 分钟」标注。
+    #
+    # 注意这是声明值不是实测值：「数据是否新鲜」由快照时间戳 ts 判断，
+    # 两者覆盖不同的问题，互不替代。
+    quote-delay-minutes: ${MARKET_DATA_QUOTE_DELAY_MINUTES:0}
 
   llm:
     # deepseek / qwen / openai / mock
@@ -123,6 +169,41 @@ app:
     # 大模型生成长文本需要 10~40 秒，与行情源的 6 秒完全不同量级
     timeout: 45s
     max-tokens: 1500
+
+  analysis:
+    # 报告存档的有效期。超过它的历史报告不再被当作「最新结论」返回，会重新生成。
+    #
+    # 为什么必须有这个窗口：报告正文是自然语言，里面写着
+    # 「最新价 1685.00，当日 +1.23%」——生成那一刻的价格被固化成了文字。
+    # 没有窗口时这份报告会被无限期当作「最新」复用，用户看到的是一句
+    # 自称「最新」的历史数据，且报告本身没有过期标注。
+    #
+    # 默认 6 小时：A 股一个交易日的交易时长是 4 小时，6 小时足够覆盖
+    # 「同一次会话里反复查看同一只标的」这个主要复用场景，
+    # 又不会让报告跨过两个交易日还在冒充最新。
+    # 设为 0 表示不限时效（旧行为，不建议）。
+    archive-max-age: ${ANALYSIS_ARCHIVE_MAX_AGE:6h}
+    #
+    # 异步任务（analysis_tasks）的保留时长。超过它的【终态】任务会被定时清理。
+    # PENDING / RUNNING 永远不会被删——那会把正在执行的任务状态行删掉，
+    # 后台线程稍后写回时更新到 0 行，任务对提交方凭空消失。
+    #
+    # 为什么要清理：这张表带 report_json（单条可达数 KB），终态之后对业务没有用途
+    # （报告已写进 ai_reports），不清理就是纯增长。默认 3 天，远大于用户等结果的时长。
+    # 设为 0 关闭清理。
+    task-retention: ${ANALYSIS_TASK_RETENTION:3d}
+    # 清理任务的执行间隔（fixedDelay：上一轮结束后再等这么久）
+    cleanup-interval: ${ANALYSIS_CLEANUP_INTERVAL:6h}
+    # 首次执行延迟。fixedDelay 默认启动即执行，而启动阶段本来就在抢数据库连接
+    cleanup-initial-delay: ${ANALYSIS_CLEANUP_INITIAL_DELAY:5m}
+
+  tushare:
+    # Tushare Pro 个人 Token（有授权协议的数据源，注册 tushare.pro 获取）。
+    # 留空则 Tushare 数据源不加入降级链（东财/腾讯被风控时直接落演示数据）。
+    # 免费档覆盖日/周/月 K 线、指数、股票搜索；不提供盘中实时报价与榜单。
+    token: ${TUSHARE_TOKEN:}
+    base-url: ${TUSHARE_BASE_URL:http://api.tushare.pro}
+    timeout: 10s
 
   session:
     # memory：单副本内存黑名单（默认）；redis：多实例共享，登出跨实例立即生效。
@@ -149,7 +230,13 @@ app:
     # 是否信任 X-Forwarded-For。默认关闭：该请求头由客户端完全可控，
     # 未部署在受信反代之后时开启等于直接给出绕过限流的方法。
     # 开启前请确认反代使用 proxy_set_header X-Forwarded-For $remote_addr（覆盖而非追加）
-    trust-forwarded-header: false
+    #
+    # 为什么必须可配置：容器部署时后端只被 nginx 访问，getRemoteAddr() 拿到的是
+    # nginx 容器的内网 IP——**所有外部用户共用同一个桶**。此时若不开启，
+    # 严格桶 20 次/分钟会被几个人很快打满，表现为「登录和 AI 分析随机 429」。
+    # docker-compose.lite.yml 与主 compose 都把它置为 true，前提是 nginx.conf
+    # 已改为 $remote_addr 覆盖（本仓库已改）。
+    trust-forwarded-header: ${RATE_LIMIT_TRUST_FORWARDED:false}
     client-ip-header: X-Forwarded-For
 
   cors:

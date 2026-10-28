@@ -3,6 +3,9 @@
 基于 `功能简介.md` 描述的功能，用 Java 技术栈重新实现的股票分析系统脚手架。
 **PC 宽屏 Web 版**，不含移动端 App。
 
+> 改动记录见 **[`修改日志.md`](修改日志.md)**（按日期倒序，含每项的改动原因与验证结果）。
+> 专题文档在 [`docs/`](docs)：两轮代码走查、板块榜与榜单数据源改造、部署指南、数据来源与授权状态等。
+
 ---
 
 ## 一、技术栈
@@ -18,6 +21,7 @@
 | 实时推送 | 原生 WebSocket（非 STOMP）`/ws/quote` | 每 3 秒推送 |
 | 限流 | 自研令牌桶 AOP（`@RateLimit`） | STRICT / LOOSE 双档 |
 | 接口文档 | springdoc-openapi | `/swagger-ui.html` |
+| 行情数据源 | 东方财富（主）→ 腾讯（备用真实源）→ **Tushare（授权数据源，可选）** → mock（兜底）；**板块榜另走 `tencent → eastmoney`**、**个股榜单另走 `eastmoney → sina`** | 四级降级链 + 两条按操作独立链，见 §8.1 |
 | 前端 | **Vue 3.5.43 + TypeScript 6.0.3 + Vite 8.3.0 + Pinia 4.0.3 + Vue Router 5.3.1** | 版本号已钉死，原因见下文 |
 | UI / 图表 | **Element Plus 2.14.5 + ECharts 6.1.0** | |
 
@@ -85,7 +89,9 @@ gupiao/
 │   │   ├── config/              配置类与 @ConfigurationProperties
 │   │   ├── market/              行情数据源抽象（唯一允许调外部行情接口的地方）
 │   │   │   ├── eastmoney/       东方财富实现（主数据源，真实行情）
-│   │   │   ├── tencent/         腾讯行情实现（备用真实源：东财被风控时接管报价/K线/指数）
+│   │   │   ├── tencent/         腾讯行情实现（备用真实源：东财被风控时接管报价/K线/指数/板块榜）
+│   │   │   ├── sina/            新浪行情实现（只提供个股榜单；不进主链，挂在 movers-chain 上）
+│   │   │   ├── tushare/         Tushare Pro 实现（有授权协议；日/周/月K线、指数、搜索）
 │   │   │   ├── mock/            内置演示数据源（链尾兜底）
 │   │   │   └── fundamental/     财务数据客户端
 │   │   ├── news/                新浪财经资讯客户端
@@ -99,16 +105,16 @@ gupiao/
 │   │       ├── watchlist/       自选股分组与条目
 │   │       ├── holding/         持仓与盈亏
 │   │       ├── news/            资讯
-│   │       └── analysis/        AI 研判（大模型 + 规则引擎降级）
-│   │           └── support/     分析协作者：取数 / 提示词 / 解析 / 兜底报告 / 存档（见 §6.12）
+│   │       └── analysis/        AI 研判（大模型 + 规则引擎降级 + 异步任务）
+│   │           └── support/     分析协作者：取数 / 生成 / 提示词 / 解析 / 兜底报告 / 存档 / 任务存储（见 §6.12）
 │   ├── src/main/resources/
 │   │   ├── application.yml      主配置（敏感项全走环境变量）
 │   │   ├── application-dev.yml  H2 内存库
 │   │   ├── application-mysql.yml MySQL 8
-│   │   └── db/migration/        Flyway 迁移脚本：{mysql,h2}/V1__baseline.sql
-│   ├── src/test/java/.../       单元测试（373 项 / 20 个类，见 5.1）
+│   │   └── db/migration/        Flyway 迁移脚本：{mysql,h2}/V1__baseline.sql + V2__analysis_tasks.sql
+│   ├── src/test/java/.../       单元测试（513 项 / 35 个类，见 5.1）
 │   ├── scripts/
-│   │   ├── smoke-test.sh        冒烟测试（54 项断言，见第五节）
+│   │   ├── smoke-test.sh        冒烟测试（50 项断言，见第五节）
 │   │   └── ws-check.mjs         WebSocket 协议验证脚本
 │   └── Dockerfile
 ├── frontend/                    前端
@@ -134,7 +140,7 @@ gupiao/
 ### 3.1 后端（开发环境，H2 内存库，无需装数据库）
 
 ```bash
-# 跑单元测试（373 项，不需要数据库，不占端口）
+# 跑单元测试（513 项，不需要数据库，不占端口）
 # 其中 19 项需要真 Redis，未提供时会逐条标记为跳过（Skipped: 19），不算失败
 bash tools/mvn.sh -f backend/pom.xml -o test
 
@@ -225,7 +231,8 @@ npm run preview       # http://localhost:4173
 
   脚本自动做四件事：① 从 `.env.example` 生成 `.env`（缺失的 `JWT_SECRET`、
   `MYSQL_ROOT_PASSWORD` 自动补随机值）；② 检查 Docker / Compose 插件；③ `docker compose up -d --build`
-  拉起 MySQL + Redis + 后端 + 前端(Nginx)；④ 轮询 `/actuator/health` 直到后端就绪。
+  拉起 MySQL + Redis + 后端 + 前端(Nginx)；④ 轮询后端容器的健康状态直到 `healthy`
+  （端口从 `.env` 读，不再写死——旧版写死 `localhost:8080` 与实际映射的 18080 不符，会永远报"未通过"）。
 
 **方式二：手动命令**
 
@@ -356,13 +363,30 @@ curl -sI http://localhost:8088/assets/element-XXXX.js | grep -i content-length
 | GET | `/quote/{code}` | 实时报价 |
 | GET | `/quote/{code}/bars?period=&limit=&start=&end=` | K 线 |
 
-**行情降级链（2026-09-21 起）**：`eastmoney → tencent → mock` 三级，逐次调用独立路由：
+**行情降级链（2026-09-21 起，2026-09-27 增补 Tushare）**：
+`eastmoney → tencent → tushare（可选）→ mock`，逐次调用独立路由：
 
 - 东财存在 **IP 级风控**（服务端直接断连，`HTTP/1.1 header parser received no bytes`，
   2026-09-19 / 09-21 两次实测连 curl 都被掐）。触发时报价 / K 线 / 指数由
   **腾讯行情（qt.gtimg.cn，真实数据）** 继续服务，`degraded` 保持 `false`——
   真实行情不该挂「演示数据」警示；实际服务方看 `/quote/source` 的 `servingByAction`。
-- 搜索与榜单是东财独有能力（腾讯无对应接口），落 mock 演示数据，此时 `degraded=true`。
+- **Tushare（可选）**：配置 `TUSHARE_TOKEN` 后加入链，作为日/周/月 K 线、指数、
+  搜索的第三级真实源（有授权协议）。免费档不提供盘中实时报价与榜单，
+  这两项 Tushare 会如实抛「不可用」交下一级。
+- 搜索是东财独有能力（腾讯/Tushare 免费档均无对应接口），落 mock 演示数据，此时 `degraded=true`。
+- **板块榜是例外**：它走自己的链 `tencent → eastmoney → mock`
+  （`app.market-data.sector-chain`）。原因不是可用性而是口径——
+  东财行业板块接口返回 496 个板块，一级/二级/三级混在一起且没有层级字段，
+  涨幅榜头部实测是「广告媒体」（3 只成分股）「其他数字媒体」（2 只），
+  并伴随「电视广播Ⅲ / Ⅱ」「林业Ⅲ / Ⅱ」这类同板块跨层级重复条目；
+  腾讯给的是 31 个一级行业，成分股规模相当、天然可比。
+  这条链只影响 `getSectors`，报价/K 线/搜索仍按主链走。
+- **个股榜单也走自己的链** `eastmoney → sina → mock`（`app.market-data.movers-chain`）。
+  这次的原因不是口径而是**能力边界**：个股榜只有东财与新浪提供（腾讯的
+  `rank/pt/getRank?board_type=hs` 实测返回空列表），此前东财一被风控，首页
+  「今日涨幅榜」就整块 503。新浪补上了这一级：`node=hs_a` 覆盖与东财完全相同的
+  五个板块（沪深主板/创业板/科创板/北交所），两家上榜名单可直接互换。
+  新浪在本项目里**只**实现榜单，因此不进主链，只挂在这条链上。
 - 每级真实源失败后进入 **30 秒冷却**（`app.market-data.upstream-cooldown`，可配 0s 关闭），
   冷却按「操作 × 数据源」隔离——报价被风控不会连累本可正常服务的 K 线。
 - 恢复是自动的：冷却到期放行探测，成功即回到主源。
@@ -408,6 +432,16 @@ curl -sI http://localhost:8088/assets/element-XXXX.js | grep -i content-length
 `GET /analysis/{code}`（优先返回存档）、`POST /analysis/{code}`（强制重生成）、
 `GET /analysis/{code}/history`
 
+**异步入口（2026-09-27 起）**：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/analysis/{code}/async` | 提交异步任务，**立即返回 202 + taskId**，大模型调用在后台线程执行 |
+| GET | `/analysis/tasks/{taskId}` | 轮询任务状态：`PENDING/RUNNING/SUCCESS/FAILED`；SUCCESS 时 `report` 非空 |
+
+异步化的动机见 §5.3 矩阵「异步 AI 生成」一行：同步 POST 会在请求线程上
+等待大模型最长 45 秒，约 5 个并发就能吃掉大半 Tomcat 线程池。
+
 ### WebSocket `/ws/quote`
 
 ```
@@ -433,16 +467,21 @@ curl -sI http://localhost:8088/assets/element-XXXX.js | grep -i content-length
 
 | 项 | 复跑命令 | 实测结果 |
 |---|---|---|
-| 后端单元测试 | `bash tools/mvn.sh -f backend/pom.xml -o test` | **373 项**：实跑 **354 项全通过** + **19 项跳过**（本机无 Redis），0 失败 / 0 错误，`BUILD SUCCESS` |
-| 后端接口冒烟 | `BASE=http://localhost:18080 bash backend/scripts/smoke-test.sh` | **54 项断言全通过**，退出码 0（含市场榜单 4 条新断言）；榜单功能实装后重新打包实跑过 |
+| 后端单元测试 | `bash tools/mvn.sh -f backend/pom.xml -o test` | **513 项 / 35 个类**：无 Redis 时实跑 494 项全通过 + 19 项跳过（**2026-10-28 本地实跑**）；配 Redis 后 19 项跳过归零，0 失败 / 0 错误，`BUILD SUCCESS` |
+| 后端接口冒烟 | `BASE=http://localhost:18080 bash backend/scripts/smoke-test.sh` | **50 项断言全通过**，退出码 0（公网受限时降级为「通过 48 + SKIP 2」）；榜单功能实装后重新打包实跑过 |
 | WebSocket 协议 | `node backend/scripts/ws-check.mjs ws://localhost:8080/ws/quote` | **12 项断言全通过** |
-| 前端单元测试 | `cd frontend && npm run test` | **7 项全通过**（`marketSource` store：不可达 / 降级 / 未就绪 / 正常四态 + 恢复后清除） |
+| 前端单元测试 | `cd frontend && npm run test` | **28 项全通过 / 3 个文件**：`marketSource` store 状态机 7 项 + 异步任务轮询 `analysisTaskPoll` 11 项 + 令牌单飞刷新与超时预算 `http` 10 项 |
 | 前端类型检查 | `cd frontend && npm run typecheck` | **0 错误**（`vue-tsc` + `tsc` 两份配置各查一遍） |
 | 前端生产构建 | `cd frontend && npm run build` | **2386 个模块**，产出 `dist/`；体积对比见 §5.4 |
 | 前后端联调 | 见 5.4 | 静态托管 / SPA 回退 / `/api` 代理 / `/ws` 代理 全部实测通过 |
 | 浏览器端到端 | 见 5.4 | 5 个页面 + 注册登录链路实测，**JS 运行时错误 0** |
 | CI 流水线 | `.github/workflows/ci.yml` | 三个 job 已配置（`backend-unit` / `frontend-build` / `integration`），两个带 `services.redis`，含 **3 处防「假绿」守卫**；**未在真实 GitHub Runner 上跑过**（本机无 Actions 环境） |
-| 真 Redis 集成测试 | `REDIS_HOST=127.0.0.1 mvn test` | 本机无 Redis，**19 项明确 SKIP**；CI 由 `services.redis` 提供实例后应全跑（见 5.3） |
+| 真 Redis 集成测试 | `docker run -d -p 6379:6379 redis:7-alpine` 后 `REDIS_HOST=127.0.0.1 REDIS_PORT=6379 mvn test` | **2026-09-27 实跑：19 项全通过、0 跳过**（11 项 Lua 限流 + 8 项跨实例会话吊销），这是本项目首次把这 19 项跑绿（此前一直 SKIP） |
+
+> **关于测试数量**：本节所有项数都来自**最近一次本地实跑**（数 Surefire 报告的 `<testcase>` 子元素，
+> 不读 `<testsuite tests>` 属性，原因见 §5.3.1 ①）。手写数字一定会随代码变动而过期，
+> **以 CI 输出为准**——`ci.yml` 的 `backend-unit` / `frontend-build` 两个 job 会分别打印
+> 后端与前端的最新项数，那是唯一权威来源，本节数字仅作量级参考。
 
 > **关于端口**：单元测试不启动 Spring 容器，不占端口。冒烟与 WS 两项需要后端在跑，
 > 本次是在 `--server.port=18080`（避开本机 `SERVER__PORT` 环境变量干扰）下实跑的，
@@ -461,7 +500,7 @@ curl -sI http://localhost:8088/assets/element-XXXX.js | grep -i content-length
 自选股（懒创建分组/重复/非法代码）、持仓（买入/补仓加权成本=1250/卖出/超量卖出/汇总）、
 AI 分析（降级标注/存档命中/历史/非法代码）、WS 统计。
 
-#### 单元测试明细（400 项）
+#### 单元测试明细（513 项 / 35 个类）
 
 JUnit 5 + AssertJ + Mockito，`spring-boot-starter-test` 已含，全部为 test scope，不引额外依赖。
 
@@ -471,29 +510,41 @@ JUnit 5 + AssertJ + Mockito，`spring-boot-starter-test` 已含，全部为 test
 
 | 测试类 | 项数 | 分布（`@Nested`） |
 |---|---|---|
-| `ResilientMarketDataProviderTest` | 51 | 主数据源正常、降级、查无此股、关闭降级、市场榜单、与真实演示源协作、对外元信息、多级降级链与冷却、**拒绝编造降级数据**（本轮新增 6 项，见 §6.12） |
+| `ResilientMarketDataProviderTest` | 59 | 主数据源正常、降级、查无此股、关闭降级、市场榜单、与真实演示源协作、对外元信息、多级降级链与冷却、**拒绝编造降级数据**、**个股榜单的独立链** 3（**2026-10-21 新增**） |
 | `WatchlistServiceTest` | 50 | 分组列表与懒创建 10、列出条目 11、添加条目 13、创建分组 7、删除分组 4、删除条目 4、常量契约 1 |
 | `AuthServiceTest` | 39 | 注册 7、登录 6、刷新令牌 9、登出 8、当前用户 2、修改密码 5、日志脱敏 2 |
 | `IndicatorCalculatorTest` | 32 | ma 简单移动平均 4、ema 3、sma 通达信口径 2、macd 3、boll 6、kdj 5、rsi 6、toList 3 |
 | `RedisTokenBucketRateLimiterTest` | 25 | 发给 Redis 的参数 6、键设计 4、脚本返回值解析 12、Redis 故障 3 |
-| `HoldingServiceTest` | 25 | 买入与补仓 9、查询与组合总览 5、卖出 5、并发首次买入 2、删除持仓 2、名称解析 2 |
+| `HoldingServiceTest` | 27 | 买入与补仓 9、查询与组合总览 7、卖出 5、并发首次买入 2、删除持仓 2、名称解析 2（**2026-10-28 新增 2**：昨收缺失时当日盈亏不被放大、行情全挂时总只数不归零） |
 | `RedisTokenRevocationStoreTest` | 19 | 键与 TTL 5、不该写入的情况 3、查询 6、Redis 故障 5 |
 | `RateLimitAspectTest` | 18 | 切入点织入 4、放行与拦截 6、客户端标识解析 8 |
 | `InMemoryTokenBucketRateLimiterTest` | 17 | 容量与拒绝 3、隔离 3、补充 2、并发 2、回收空闲桶 2、stats 1、配置默认值 4 |
-| `TencentMarketDataProviderParseTest` | 15 | 实时报价、日/周/月 K 线、分时、指数（样本均为真实上游响应） |
+| `TencentMarketDataProviderParseTest` | 21 | 实时报价、日/周/月 K 线、分时、指数、**板块榜单**（排序 / 涨跌家数 / 领涨股代码，样本均为真实上游响应） |
 | `LlmJsonParserTest` | 12 | 三级降级解析 6、围栏剥离 2、字段读取 4（**本轮新增**） |
 | `RedisTokenBucketRateLimiterRedisTest` ⚑ | 11 | 令牌扣减 4、多实例共享配额 2、键隔离与回收 4、令牌补充 1 |
 | `PromptBuilderTest` | 11 | 数据齐全 4、数据缺失 3、数据可信度 4（**本轮新增**） |
 | `RuleBasedReportGeneratorTest` | 11 | 数据可信度约束 3、缺数时的措辞 3、由数据推导的结论 2、元信息 3（**本轮新增**） |
-| `AnalysisServiceOrchestrationTest` | 9 | 存档命中与强制刷新 3、校验与失败路径 4、大模型成功与历史 2（**本轮新增**，编排分支判定） |
+| `AnalysisServiceOrchestrationTest` | 12 | 存档命中与强制刷新 3、校验与失败路径 2、异步提交与任务查询 6、历史 1（**2026-09-27 异步化改造后新增异步分支**；**2026-10-28 新增 1**：任务查询带归属条件） |
+| `TushareMarketDataProviderParseTest` | 7 | 日线解析 3、指数解析 2、股票清单解析 2（**2026-09-27 新增**，按列名取值验证） |
 | `JwtTokenServiceTest` | 9 | 签发与解析往返 3、校验失败的错误码映射 5、构造期防线 1（**本轮新增**，能力边界） |
 | `AuthControllerValidationTest` | 9 | 注册校验 3、登录校验与防用户枚举 2、通用异常映射 4（**本轮新增**，standalone MockMvc 切片） |
-| `QuoteServiceTest` | 9 | 轮转切片：相邻批次零重合 7、空池兜底等 2（**只测轮播**——`QuoteService` 没有缓存层，见 §7.7） |
+| `QuoteServiceTest` | 11 | 换批行为 4、边界与容错 5、**并行取价 2**（2026-10-16 并行化改造后新增 `Concurrency` 切片：先整批投递再统一等待、上游卡住时按总预算快速返回。只测轮播——`QuoteService` 没有缓存层，见 §7.7） |
+| `QuoteServiceUpstreamTest` | 11 | **2026-10-28 新增**：报价与 K 线 6（直通 / 失败上抛 / 空 K 线 404 / 起止日期真实生效 / 单边区间 / 空串等同未传）、榜单条数收敛 3、数据源状态 2 |
+| `QuoteSessionRegistryTest` | 12 | **2026-10-28 新增**：正反向索引一致性 3、连接关闭清理 4、订阅上限 2、监控快照与并发 3（钉住「三张表不同步」导致的悬挂订阅） |
+| `JwtAuthenticationFilterTest` | 9 | **2026-10-28 新增**：登录态识别 4、失败降级为匿名 3、豁免路径 2（此前全站唯一鉴权关卡零测试） |
 | `AsyncConfigTest` | 8 | 基本参数 4、饱和时的行为 2、关闭语义 2 |
 | `RedisTokenRevocationStoreRedisTest` ⚑ | 8 | 跨实例可见性 4、过期 2、登出流程形状 2 |
 | `MockMarketDataProviderMoversTest` | 5 | 涨幅降序 1、跌幅升序 1、成交额榜 1、limit 收敛 1、条目身份 1 |
 | `EastMoneyMoversParseTest` | 4 | 真实样本解析 1、data:null 拒绝形态 1、非 6 位代码过滤 1、`"-"` 容错 1 |
+| `SinaMoversParseTest` | 8 | 真实样本混合字段类型 1、涨幅榜降序 1、跌幅榜本地重排 1、成交额榜 1、停牌 0 价丢弃 1、非 6 位代码丢弃 1、`null`/空数组 1、UTF-8 与 GBK 双解码 1（**2026-10-21 新增**） |
+| `EastMoneySectorParseTest` | 5 | 领涨股代码 f140、字符串数值、`"-"` 归 null、data:null 拒绝形态、缺代码/名称的行跳过 |
 | `MoverMetricParseTest` | 3 | 小驼峰参数 1、枚举名形态 1、非法与空值 1 |
+| `AiReportArchiverTest` | 9 | 存档时效窗口 6（时间下限真的传进 SQL、关闭时效传 0、过期/坏 JSON/读库异常均按「无存档」处理、命中时打 `fromArchive` 标记）、写入策略 3（规则化报告不入档、大模型报告连模型名一起落库、写库失败不回滚结果）（**2026-10-16 新增**） |
+| `MarketDataSupportConfigChainTest` | 12 | 配置顺序忠实执行 2、未知源名启动即失败 1、mock 恒定链尾 1、Tushare 无 Token 时跳过 1、离线 mock 模式不注册真实源 1、重复源名去重 1（**2026-10-16 新增**）、板块榜独立链 2、个股榜单独立链 3（**2026-10-21 新增**） |
+| `MarketDataPropertiesBindingTest` | 4 | `movers-chain` 绑定 1、两条专用链互不干扰 1、缺省默认值 1、配置里写 mock 被剔除 1（**2026-10-21 新增**） |
+| `AnalysisTaskExecutorTest` | 5 | 线程池满时明确标 FAILED 1、成功路径 RUNNING→取数→生成→归档→SUCCESS 1、代码不存在时不产生模型费用 1、生成异常不外抛 1、降级为规则报告仍算 SUCCESS 1（**2026-10-16 新增**） |
+| `AnalysisTaskCleanupJobTest` | 5 | 时间下限按保留期回溯并累加指标 1、保留期为 0 / 负数时不删 2、无行可删时不累加指标 1、删除失败不外抛 1（**2026-10-16 新增**） |
+| `FundamentalOverviewCacheTest` | 5 | 起真实 `AnnotationConfigApplicationContext` 断言「缓存对内部调用也生效」：compare 二次全命中 1、杜邦复用概览缓存 1、重复读概览只打一次上游 1、不同标的各自缓存 1、缓存内容完整 1（**2026-10-16 新增**，见 §6.20） |
 
 > ⚑ = 需要真 Redis。未提供时这 19 项会**逐条标记为跳过**（不是失败、也不是静默消失），
 > 在 Surefire 汇总里如实显示 `Skipped: 19`。
@@ -599,23 +650,23 @@ JUnit 5 + AssertJ + Mockito，`spring-boot-starter-test` 已含，全部为 test
 | 能力 | 现状 | 证据 / 差距 |
 |---|---|---|
 | 限流（单机令牌桶） | ✅ | `InMemoryTokenBucketRateLimiterTest` 17 项，含 16 线程抢 20 个令牌的并发断言 |
-| 限流（Redis 分布式） | ✅ | 分三层验证：**Java 侧换算与解析** 25 项；**Lua 脚本本身** 11 项（本机无 Redis 故跳过）；**整条 HTTP 栈** 由 CI 的 `integration` job 以 `RATE_LIMIT_STORE=redis` 跑完 50 项冒烟 |
+| 限流（Redis 分布式） | ✅ | 分三层验证：**Java 侧换算与解析** 25 项；**Lua 脚本本身** 11 项（**2026-09-27 起本机已用 Docker 临时 Redis 实跑通过，Skipped 归零**）；**整条 HTTP 栈** 由 CI 的 `integration` job 以 `RATE_LIMIT_STORE=redis` 跑完 50 项冒烟 |
 | 限流切面（注解是否真生效） | ✅ | `RateLimitAspectTest` 18 项；其中 4 项用 `AspectJProxyFactory` **真实织入代理**，验证的是「切入点确实匹配到了方法」，而不是「直接调 `around()` 能跑」 |
 | 会话吊销（单机） | ✅ | `AuthServiceTest` 39 项间接覆盖；`AuthService#logout` 只吊销一半的缺陷已修（第六节第 9 条） |
-| 会话吊销（多实例） | ⚠️ | `RedisTokenRevocationStore` 已实现 + 19 项 Java 侧测试；**跨实例可见性的 8 项需真 Redis**（本机跳过）。`app.session.store` **默认仍是 `memory`**，未改默认值 |
+| 会话吊销（多实例） | ✅ | `RedisTokenRevocationStore` 已实现 + 19 项 Java 侧测试；**跨实例可见性的 8 项 2026-09-27 起本机已用 Docker 临时 Redis 实跑通过**（Skipped 归零）。`app.session.store` **默认仍是 `memory`**，多实例部署前必须显式设 `redis` |
 | 登出是否真正生效 | ✅ | 冒烟测试 4 条断言：登出后 access 与 refresh 同时失效，含「仅凭 refreshToken 登出」 |
-| 行情降级与错误分界 | ✅ | `ResilientMarketDataProviderTest` 32 项，含「查无此股绝不降级」6 项 |
+| 行情降级与错误分界 | ✅ | `ResilientMarketDataProviderTest` 56 项，含「查无此股绝不降级」6 项与「按操作的降级链」5 项；降级链装配另由 `MarketDataSupportConfigChainTest` 9 项覆盖 |
 | 越权防护（自选股） | ✅ | `WatchlistServiceTest` 50 项，断言**真实 SQL 片段与参数**含 `user_id`；另做过变异验证（见下） |
 | 线程池语义 | ✅ | `AsyncConfigTest` 8 项：有界队列、`CallerRunsPolicy` 不丢任务、优雅停机等待 |
 | 异步扇出（分析取数三路并发） | ⚠️ | 代码已实现（3 × `CompletableFuture.supplyAsync` + 逐路兜底），已抽到 `AnalysisInputLoader`，但**仍无单测**（它是 Spring Bean，测它要搭三个依赖的替身；判据上它属于「坏了会报错」那一类，优先级低于纯逻辑） |
-| **异步 AI 生成** | ❌ | **明确未实现**：`AnalysisService#fromLlm` 在**请求线程上同步等待**至 `app.llm.timeout`（默认 45s），无任务队列、无 `taskId`、无回执。已把现状与改造落点写进类注释 |
+| **异步 AI 生成** | ✅ | **已实现**（2026-09-27）：新增 `POST /analysis/{code}/async`（返回 202 + taskId）与 `GET /analysis/tasks/{taskId}`（轮询结果），大模型调用由 `AnalysisTaskExecutor` 在专用线程池后台执行，不再占用 Tomcat 工作线程。任务状态持久化到 `analysis_tasks` 表（Flyway V2），状态机 `PENDING → RUNNING → SUCCESS/FAILED`。生成逻辑抽为 `AnalysisGenerator` 供同步/异步两条路径复用。**单测已覆盖**（`AnalysisServiceOrchestrationTest` 异步提交/查询分支），但真实大模型调用链路仍未被验证（未配 `LLM_API_KEY`） |
 | **WS 鉴权** | ❌ | **有意不做**，且已论证：`/ws/quote` 只推公开行情，不涉及用户数据。改造方案（先调 REST 换一次性 ticket 再握手，避免把长效 token 放进 query）写在 `QuoteWebSocketHandler` 类注释里 |
 | MySQL profile | ✅ | **已实跑**（2026-09-24）。两条路径都验过：① 空库 → Flyway 执行 V1 建表，注册/登录/自选股可用；② **既有库升级 → `baseline-on-migrate` 打基线跳过 V1，`users`/`holdings`/`ai_reports`/`watchlist_groups` 行数与升级前逐条一致**（数据未丢），`flyway_schema_history` 记录 `type=BASELINE, success=1` |
 | Docker Compose | ✅ | **已实跑通过**（2026-09-21，2026-09-24 复跑）。拉起 4 容器，后端健康 UP、连上 MySQL、前端可访问。实跑修复了变量名不一致（`JWT_SECRET`→`APP_JWT_SECRET`、`DB_URL`、`SPRING_DATA_REDIS_*`）、JDBC `characterEncoding=utf8mb4`→`UTF-8`、宿主端口冲突（3306/8080 被占→改 3307/18080）、db-init 时序竞态 4 类缺陷。**2026-09-24 复跑发现并修掉两个部署缺陷**：前端缺 `.dockerignore` 导致宿主机 `node_modules` 覆盖容器依赖树；以及「改了代码没重建镜像 → 部署仍是旧产物」（判定方法与基准字节数见 §3.4） |
 | 真实大模型输出 | ⚠️ | 未配置 `LLM_API_KEY`，走规则引擎；**大模型调用链路未被真实验证** |
 | 真实行情链路 | ⚠️ | 上游 `push2` / `push2his` 本机不可达，报价与 K 线走降级数据源 |
 | CI | ⚠️ | 三个 job 已配置、YAML 结构经解析校验，**未在真实 GitHub Runner 上跑过** |
-| 前端交互路径 | ⚠️ | 类型检查 / 生产构建 / 浏览器 5 个页面实跑已验证；另有 7 项 Vitest 覆盖数据源状态 store。更复杂的交互路径未逐一覆盖 |
+| 前端交互路径 | ⚠️ | 类型检查 / 生产构建 / 浏览器 5 个页面实跑已验证；另有 **28 项 Vitest（3 个文件）**：数据源状态 store、异步任务轮询、令牌单飞刷新与超时预算。更复杂的交互路径未逐一覆盖 |
 
 #### 5.3.1 这套验证是怎么落到实处的
 
@@ -633,7 +684,7 @@ JUnit 5 + AssertJ + Mockito，`spring-boot-starter-test` 已含，全部为 test
   Redis 没起来会表现为红，而不是一个看起来正常、其实什么都没验的绿。
 
 > 顺带一个统计口径的坑：数用例必须数 `<testcase>` 子元素，
-> 不能读 `<testsuite tests="...">` 属性——同一个结果集，后者给出 242，前者给出 247。
+> 不能读 `<testsuite tests="...">` 属性——同一个结果集，后者给出 437，前者给出 442。
 
 **② 断言本身有没有用，用变异验证反证。**
 
@@ -1171,7 +1222,7 @@ private boolean exists(String prefix, String rawId) {
 前端把假榜单当真实行情渲染，用户没有任何线索。
 
 **根因**：降级链 `eastmoney → tencent → mock` 把「能力」和「兜底」混成了一个概念。
-`mock` 被当成任何操作的链尾兜底，但**搜索和榜单是东财独有的能力**（腾讯无对应接口），
+`mock` 被当成任何操作的链尾兜底，但**搜索和个股榜单是东财独有的能力**（腾讯无对应接口），
 一旦落到 mock，它就会用内置的少量股票拼一份榜单出来。
 
 **修复**：把判断从"调用处"上移到"数据源的能力声明"——`MarketDataProvider` 增加能力位：
@@ -1186,7 +1237,8 @@ default boolean acceptableAsFallback(String action) { return true; }
 ```java
 @Override
 public boolean acceptableAsFallback(String action) {
-    return !"getTopMovers".equals(action);   // 榜单宁可不可用，也不编造
+    // 榜单与板块榜同属「排序结果」，宁可不可用，也不编造
+    return !"getTopMovers".equals(action) && !"getSectors".equals(action);
 }
 ```
 
@@ -1194,8 +1246,10 @@ public boolean acceptableAsFallback(String action) {
 `app.market_data.fabrication_refused` 指标——**单独计数是必须的**，
 否则「数据源拒绝供数」会被算进「降级成功」里，问题又被掩盖一层。
 
-最终行为：整体降级时 `/quote/movers` 返回 **503 +「市场榜单暂不可用」**，
-前端显示「暂不可用」并保留上一批数据，不再静默换上假榜单。
+最终行为：**两家真实榜单源（东财、新浪）都不可用**时，`/quote/movers` 返回
+**503 +「市场榜单暂不可用」**，前端显示「暂不可用」并提供重试入口，
+同时保留上一批数据，不再静默换上假榜单。
+（2026-10-21 之前这句话的主语只有东财——那时它是唯一的榜单源，见 §8.1 的 `movers-chain`。）
 
 **两侧实测**：部署环境（8088 后端）`GET /api/v1/quote/movers` 返回 **503**，
 符合设计；本地上游可达时正常返回真实榜单。新增 6 项单测（`FabricationRefused` 嵌套类）。
@@ -1231,7 +1285,9 @@ public boolean acceptableAsFallback(String action) {
 **结果**：新增 **34 项测试**覆盖 Prompt 组装、规则兜底、JSON 容错解析
 （缺字段 / 前后有多余文本 / 类型不符 / 空响应）。后端测试总数 333 → **373**。
 此后第二轮又补了 27 项：`AnalysisService` 编排分支 9 项、`JwtTokenService` 能力边界 9 项、
-`AuthController` 校验与异常映射 9 项（见 §6.19），总数 **400**。
+`AuthController` 校验与异常映射 9 项（见 §6.19），总数 **400**（按 Surefire 实测口径为 409）。
+**2026-10-16 第三轮再补 33 项**（异步链路、存档时效、降级链装配、财务缓存、轮播并行），
+后端测试总数 **513 项 / 35 个类**——这也是本节其他地方采用的口径。
 
 **刻意没假装覆盖的部分**：「读存档还是重新生成」这条分支判定、三路
 `CompletableFuture` 的逐路兜底，仍无单测——已在 §7 如实标注。
@@ -1251,7 +1307,13 @@ public boolean acceptableAsFallback(String action) {
 
 **修复**：引入 Vitest + jsdom，新增 `src/stores/marketSource.test.ts`，**7 项**覆盖
 四种状态（真实 / 降级 / 不可达 / 恢复）与对应的徽标文案、告警等级，
-以及「从不可达恢复后告警必须清除」。`npm run test` 与 `npm run build` 串在一条链上。
+以及「从不可达恢复后告警必须清除」。
+
+> **当时的缺口**：测试写了但只存在本地——`build` 脚本串的是 `typecheck && vite build`，
+> **没有 `test`**；CI 的 `frontend-build` job 也没跑 `npm test`。于是「有测试」和
+> 「测试被执行」之间断了一环。2026-10-16 已补齐：`ci.yml` 的 `frontend-build`
+> job 增加独立 `npm test` 步骤，前端测试从 7 项扩到 **28 项 / 3 个文件**
+> （新增 `analysisTaskPoll.test.ts` 11 项、`http.test.ts` 10 项）。
 
 ---
 
@@ -1443,17 +1505,25 @@ docker exec stocklab-frontend ls -l /usr/share/nginx/html/assets | grep -E 'elem
    `AuthServiceTest.changePasswordDoesNotRevokeExistingTokens` 是一条
    **特征化测试**，专门固化这一现状——将来若实现了版本号机制，这条会红，
    逼开发者显式确认这是有意变更。
-3. **AI 分析是同步阻塞调用**。后端 `LlmClient` 同步等待大模型，
+3. **首屏 `GET /analysis/{code}` 仍是同步阻塞调用**。后端 `LlmClient` 同步等待大模型，
    超时上限是 `app.llm.timeout`（默认 **45 秒**），期间占用一个 Tomcat 线程。
-   约 5 个并发就能吃掉大半线程池余量。生产应改为异步任务 + 轮询/推送结果，
-   当前**未实现**。
+   约 5 个并发就能吃掉大半线程池余量。
+
+   > **异步链路已经实装**（2026-09-27 后端、2026-10-16 前端接通）：
+   > `POST /analysis/{code}/async` 返回 202 + `taskId`，由 `AnalysisTaskExecutor`
+   > 在专用线程池后台生成，前端轮询 `GET /analysis/tasks/{taskId}`。
+   > 界面上的**「重新生成」走的就是这条异步链路**（`AnalysisView.vue` 的 `regenerate()`
+   > → `analysisApi.submit` + `pollAnalysisTask`），前端超时给到 75s > 后端 45s，
+   > 不会出现「后端还在算、前端先断」。
+   > **仍走同步的只剩首屏那次读**：`loadReport()` 调 `GET /analysis/{code}`，
+   > 它在有存档时直接返回存档（存档带时效窗口，超时即视为无存档），无存档才当场生成。
+   > 若将来把首屏也改成纯异步，这一条即可删除。
 
    > 这一条**已经写进代码**，不只是写在 README 里：
    > `AnalysisService#generate` 的 javadoc 标题就是
    > 「⚠️ 这里的大模型调用是同步阻塞的，不是异步任务」，
    > 内容说明当前为何可接受（`STRICT` 限流顺带兜住了线程耗尽）、
-   > 以及哪三种情况下必须改（额度调高 / 超时调大 / 新增批量入口）、
-   > 改造落点在哪（提交任务 → 返回 `taskId` → 轮询或 WS 回推）。
+   > 以及哪三种情况下必须改（额度调高 / 超时调大 / 新增批量入口）。
    > **注释会跟着代码走，README 不会**——所以关键边界要写在注释里。
 4. **WebSocket 未鉴权**（有意为之）。推送的只有公开行情。
    若将来要推送「我的持仓实时盈亏」，握手必须带凭证——但浏览器 WebSocket
@@ -1468,26 +1538,32 @@ docker exec stocklab-frontend ls -l /usr/share/nginx/html/assets | grep -E 'elem
    `echarts` chunk **1,117.14 kB（gzip 370.60 kB）**、样式另有 **gzip 47.92 kB**，
    合计约 735 kB gzip。改为按需后合计约 **415 kB gzip（−43%）**，
    逐项对比与改法见 §5.4。**体积数据前后都是实测的，不是估算。**
-7. **单元测试是 23 个类 / 400 项，不是"覆盖完了"**。明细见 §5.1，
+7. **单元测试是 35 个类 / 513 项，不是"覆盖完了"**。明细见 §5.1，
    生产级能力的验证状态见 §5.3 矩阵。仍没有单元测试、只有 HTTP 冒烟兜着的：
    - **其余 7 个 Controller**。`AuthControllerValidationTest`（9 项，standalone
      MockMvc）只钉住了鉴权接口的参数校验与异常映射链路，作为模式样板；
      Watchlist / Holding / Analysis / Fundamental / Indicator / News / Quote
      的校验边界仍靠冒烟。standalone 模式也不覆盖 `@RateLimit` 切面与
      `@CurrentUserId` 参数解析器——这两块只有集成环境能验证
-   - `QuoteService` 的**上游包装方法**（`getQuote` / `getBars` / `topMovers` /
-     `sourceStatus`）。已有测试只覆盖轮播切片（`getCarousel`）。
-     另外要说清一个事实：**`QuoteService` 没有缓存层**，每次调用直达
+   - ~~`QuoteService` 的上游包装方法~~ **已于 2026-10-28 补上**
+     （`QuoteServiceUpstreamTest` 11 项，覆盖直通 / 失败上抛 / 空 K 线 404 /
+     起止日期过滤 / limit 收敛 / 数据源状态）。
+     但另一个事实没变：**`QuoteService` 没有缓存层**，每次调用直达
      `ResilientMarketDataProvider`——上游（东方财富/腾讯）看到的请求量
      与用户请求量 1:1。首页轮播 10 秒换批意味着持续打上游。
      短 TTL 缓存是后续值得做的改进，做的时候缓存命中/过期/击穿需要一起补测
+   - `ws` 包的**推送侧**（`QuoteWebSocketHandler` / `QuotePusher`）。
+     登记表 `QuoteSessionRegistry` 已于 2026-10-28 补测（12 项，钉住三张表同步），
+     但握手、消息解析、定时推送循环仍零测试——那部分涉及真实 `WebSocketSession`，
+     需要 standalone 切片或集成环境
    - `AnalysisInputLoader` 的**异步扇出**三路 `CompletableFuture` 的逐路兜底
      （编排分支判定已由 `AnalysisServiceOrchestrationTest` 9 项覆盖，矩阵仍 ⚠️）
    - 前端**组件与交互路径仍无测试**：本轮补的是 7 项 store 单测
      （`marketSource` 的四种状态与恢复后清除），组件渲染、表单提交、
      WebSocket 驱动的价格刷新仍未覆盖
 
-   补的顺序建议按「改了容易出事」排：`QuoteService` 上游包装 > 其余 Controller > 前端组件。
+   补的顺序建议按「改了容易出事」排：ws 推送侧 > 其余 Controller > 前端组件。
+   （`QuoteService` 上游包装与 `JwtAuthenticationFilter` 已于 2026-10-28 补完，移出此列。）
    判断依据不是「哪个重要」，而是**哪个失效时不会报错**——
    缓存少刷新一次、扇出某一路静默返回 null、Controller 少一个 `@Valid`
    导致非法入参直穿到 Service，接口全都照样返回 200，日志里一行 ERROR 都没有。
@@ -1497,26 +1573,26 @@ docker exec stocklab-frontend ls -l /usr/share/nginx/html/assets | grep -E 'elem
    「空闲 10 分钟后应被回收」这半条没测——真等 10 分钟不现实，为可测性把阈值
    改成可注入又只是为了测试加抽象。**这半条目前只有代码走查，没有测试兜底**，
    属于已知空白。（Redis 实现那边靠 `PEXPIRE` 兜底回收，同样只验证了「键有 TTL」。）
-9. **真 Redis 那 19 项测试，本机从来没跑过——CI 跑没跑过也不知道**。
-   这是上一版 README 第 9 条「完全没测」的**降级修订**，但还没到可以放心的程度：
+9. **真 Redis 那 19 项测试，2026-09-27 起本机已用 Docker 临时 Redis 实跑通过**。
+   用 `docker run -d --name stocklab-test-redis -p 6379:6379 redis:7-alpine` 起一个
+   临时容器，再以 `REDIS_HOST=127.0.0.1 REDIS_PORT=6379 mvn test` 复跑。实测结果：
 
    | 层次 | 项数 | 状态 |
    |---|---|---|
    | Java 侧换算 / 参数 / 解析（限流） | 25 | ✅ 本机实跑通过（用替身 Redis） |
    | Java 侧键设计 / TTL / 故障策略（会话） | 19 | ✅ 本机实跑通过（用替身 Redis） |
-   | Lua 脚本真实行为（限流） | 11 | ⚠️ 本机 **SKIP**，`services.redis` 就绪后由 CI 实跑 |
-   | 跨实例可见性（会话） | 8 | ⚠️ 本机 **SKIP**，同上 |
+   | Lua 脚本真实行为（限流） | 11 | ✅ **2026-09-27 本机真 Redis 实跑通过** |
+   | 跨实例可见性（会话） | 8 | ✅ **2026-09-27 本机真 Redis 实跑通过** |
    | 整条 HTTP 栈（`RATE_LIMIT_STORE=redis`） | 50 断言 | ⚠️ 只有 CI 配置，**未执行过** |
 
-   所以现在的准确说法是：**「限流器的 Redis 实现」从「完全没测」变成了
-   「Java 层测了、脚本层和装配层有测试但没跑过」**。
-   本机没有 Redis 实例（也没有 Docker 守护进程），这 19 项在本地
-   逐条标记为 `Skipped` 而不是静默消失（做法见 §5.3.1 ①）。
-   **多实例部署前，必须先在能提供 Redis 的环境把这 19 项跑绿**——
-   在那之前，`app.rate-limit.store: redis` 仍是「有测试、无执行证据」。
+   全量测试在真 Redis 环境下 **442 项、0 失败、0 跳过**（此前这 19 项标记为
+   `Skipped: 19`）。这意味着「限流器的 Lua 脚本」与「会话吊销的跨实例可见性」
+   两件事从「有测试、无执行证据」变成了「有可复跑的执行证据」。
+   **唯一仍未验证的是整条 HTTP 栈**（`RATE_LIMIT_STORE=redis` 下的 50 项冒烟，
+   需 CI 的 `integration` job 或本地起完整后端），见下一条。
 10. **CI 流水线未在真实 GitHub Runner 上跑过**。`.github/workflows/ci.yml` 写了三个
    job（`backend-unit` / `frontend-build` / `integration`），本地用 PyYAML 校验过结构
-   （3 job、5/6/13 个 step、两个 job 带 `services=[redis]`），但
+   （3 job、5/7/13 个 step、两个 job 带 `services=[redis]`），但
    **Actions 环境本身没执行过**——`npm ci` 能否复现本地依赖树、Actions 上能否连到
    东方财富、`mvn` 缓存是否生效、service container 的 health check 是否真能等到
    Redis ready，全部属于未验证。
@@ -1547,8 +1623,9 @@ docker exec stocklab-frontend ls -l /usr/share/nginx/html/assets | grep -E 'elem
 
 ### 8.1 数据接入方式与授权状态（如实说明）
 
-**本工程的行情与资讯数据，不是通过授权渠道、也不是通过官方开放 API 获取的**，
-而是直接请求第三方财经网站**给自家网页使用的内部数据接口**。完整清点与实测证据见
+**本工程的行情与资讯数据，主体仍是**直接请求第三方财经网站**给自家网页使用的内部接口**
+（东方财富 / 腾讯 / 新浪，均未获授权）。作为走向合规的补充，已接入**有授权协议的
+Tushare Pro**（个人 Token 制，覆盖日/周/月 K 线、指数、股票搜索）。完整清点与实测证据见
 [`docs/数据来源与授权状态说明-20260924.md`](docs/数据来源与授权状态说明-20260924.md)。
 
 | 数据域 | 上游 | 接口 | 接入方式 | 授权状态 |
@@ -1556,9 +1633,11 @@ docker exec stocklab-frontend ls -l /usr/share/nginx/html/assets | grep -E 'elem
 | 实时报价 | 东方财富 | `push2.eastmoney.com/api/qt/stock/get` | JSON 结构解析 | ❌ 未授权 |
 | K 线 | 东方财富 | `push2his.eastmoney.com/api/qt/stock/kline/get` | JSON 结构解析 | ❌ 未授权 |
 | 榜单 / 全 A 清单 | 东方财富 | `push2.eastmoney.com/api/qt/clist/get` | JSON 结构解析 | ❌ 未授权 |
+| 个股榜单（备用） | 新浪 | `vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData` | JSON 数组解析（`node=hs_a`） | ❌ 未授权 |
 | 指数 | 东方财富 | `push2.eastmoney.com/api/qt/ulist.np/get` | JSON 结构解析 | ❌ 未授权 |
 | 财务 | 东方财富 | `datacenter-web.eastmoney.com/api/data/v1/get` | JSON 结构解析 | ❌ 未授权 |
 | 备用报价 / K 线 | 腾讯 | `qt.gtimg.cn` / `web.ifzq.gtimg.cn` | GBK 文本协议 | ❌ 未授权 |
+| 日/周/月 K 线 / 指数 / 搜索 | Tushare Pro | `api.tushare.pro`（`daily`/`weekly`/`monthly`/`index_daily`/`stock_basic`） | 官方 HTTP API + 个人 Token | ✅ 已授权（免费积分档，不提供盘中实时报价与榜单） |
 | 财经资讯 | 新浪 | `feed.mix.sina.com.cn/api/roll/get` | JSON 结构解析 | ❌ 未授权 |
 | AI 研判 | DeepSeek / 阿里云百炼 | `api.deepseek.com` / `dashscope.aliyuncs.com` | 官方 API + API Key | ✅ 已授权 |
 

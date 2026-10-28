@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { MagicStick, Refresh, Search, Clock } from '@element-plus/icons-vue'
+import DisclaimerNote from '@/components/DisclaimerNote.vue'
 import { analysisApi, quoteApi } from '@/api/endpoints'
+import { POLL_ABORTED, pollAnalysisTask } from '@/api/analysisTaskPoll'
+import { BizError } from '@/api/http'
 import type { AnalysisReport, StockBrief } from '@/api/types'
 import { formatIsoDateTime } from '@/api/types'
 
@@ -21,6 +24,19 @@ import { formatIsoDateTime } from '@/api/types'
  *
  * 另外 `fromArchive` 为 true 表示这是库里的历史结论，
  * 界面上要标明生成时间，否则用户会拿几天前的判断当实时结论。
+ *
+ * <h2>两个按钮走的是两条完全不同的链路（重要）</h2>
+ * <table>
+ *   <tr><th>按钮</th><th>链路</th><th>等待时长</th></tr>
+ *   <tr><td>读取最新存档</td><td>`GET /analysis/{code}` 同步</td>
+ *       <td>命中存档时瞬时；<b>无存档时会同步生成一次</b>，最长 45s</td></tr>
+ *   <tr><td>重新生成</td><td>`POST /async` + 轮询</td>
+ *       <td>立即返回 taskId，生成在后台线程池，页面全程可交互</td></tr>
+ * </table>
+ *
+ * 「重新生成」必须走异步：后端为此专门隔离了一个线程池
+ * （`analysisTaskThreadPool`），用同步端点会让那次调用重新占住 Tomcat 线程，
+ * 异步化形同虚设；而且同步路径最长 45s，用户只能对着转圈等。
  */
 const route = useRoute()
 const router = useRouter()
@@ -30,6 +46,8 @@ const report = ref<AnalysisReport | null>(null)
 const history = ref<AnalysisReport[]>([])
 const loading = ref(false)
 const regenerating = ref(false)
+/** 生成过程中的进度文案，仅在 regenerating 为 true 时有意义 */
+const progressText = ref('')
 const errorMessage = ref<string | null>(null)
 
 /** 无 code 时的输入框 */
@@ -46,11 +64,29 @@ const modelLabel = computed(() => {
     : `大模型 ${report.value.model}`
 })
 
+/**
+ * 当前进行中的轮询。
+ *
+ * 必须持有它并在两种时机取消：切换标的、组件卸载。
+ * 否则「看着 600519 的分析，中途跳到 000858」时，
+ * 前一个任务的轮询返回后会把 600519 的报告渲染到 000858 的页面上——
+ * 用户看到的是张冠李戴的结论，而且完全无从察觉。
+ */
+let pollAbort: AbortController | null = null
+
+function cancelPoll(): void {
+  pollAbort?.abort()
+  pollAbort = null
+}
+
 onMounted(() => {
   if (code.value) void loadReport()
 })
 
+onUnmounted(cancelPoll)
+
 watch(code, (v) => {
+  cancelPoll()
   if (v) void loadReport()
   else {
     report.value = null
@@ -78,6 +114,12 @@ function pick(target: string): void {
   router.push({ name: 'analysis-detail', params: { code: target } })
 }
 
+/**
+ * 读取分析结论。
+ *
+ * 超时按分析预算给（见 analysisApi.get）——这个接口在无存档时
+ * 会同步触发生成，用全局 20s 会在那种情况下必然失败。
+ */
 async function loadReport(): Promise<void> {
   loading.value = true
   errorMessage.value = null
@@ -93,21 +135,53 @@ async function loadReport(): Promise<void> {
 }
 
 /**
- * 强制重新生成。
+ * 强制重新生成：提交异步任务 → 轮询到终态。
  *
- * 与「获取」分开成两个按钮，是因为重新生成会真实消耗一次大模型调用：
+ * 与「读取最新存档」分开成两个按钮，是因为重新生成会真实消耗一次大模型调用：
  * 用户打开页面时不该默认触发它，得由用户显式决定。
  */
 async function regenerate(): Promise<void> {
+  // 连点两次时，前一个轮询若不取消，两个任务的结果会互相覆盖，
+  // 最后留在页面上的是哪个报告取决于响应顺序（不确定）。
+  cancelPoll()
+
   regenerating.value = true
+  progressText.value = '正在提交分析任务…'
+
+  const controller = new AbortController()
+  pollAbort = controller
+
   try {
-    report.value = await analysisApi.regenerate(code.value)
+    const submission = await analysisApi.submit(code.value)
+    progressText.value = '任务已提交，正在生成（通常 10~40 秒）…'
+
+    const result = await pollAnalysisTask(submission.taskId, {
+      signal: controller.signal,
+      onProgress: (view, attempt) => {
+        progressText.value =
+          view.status === 'PENDING'
+            ? '任务排队中…'
+            : `正在生成（已查询 ${attempt} 次，通常 10~40 秒）…`
+      },
+    })
+
+    report.value = result
     history.value = await analysisApi.history(code.value, 10).catch(() => [])
     ElMessage.success('已重新生成')
   } catch (e) {
+    // 主动取消（切换标的 / 卸载 / 连点）不是错误，静默退出
+    if (e instanceof BizError && e.code === POLL_ABORTED) {
+      return
+    }
     ElMessage.error(e instanceof Error ? e.message : '重新生成失败')
   } finally {
-    regenerating.value = false
+    // 只有「仍是自己这次轮询」时才清理状态：
+    // 否则被取消的那次会在新任务运行时把 regenerating 置回 false
+    if (pollAbort === controller) {
+      pollAbort = null
+      regenerating.value = false
+      progressText.value = ''
+    }
   }
 }
 </script>
@@ -156,7 +230,13 @@ async function regenerate(): Promise<void> {
             <span class="mono muted">{{ code }}</span>
           </span>
           <div class="actions">
-            <el-button size="small" :icon="Refresh" :loading="loading" @click="loadReport">
+            <el-button
+              size="small"
+              :icon="Refresh"
+              :loading="loading"
+              :disabled="regenerating"
+              @click="loadReport"
+            >
               读取最新存档
             </el-button>
             <el-button
@@ -172,6 +252,21 @@ async function regenerate(): Promise<void> {
         </div>
 
         <div class="card__body">
+          <!--
+            生成进度提示。异步链路下这次等待是「可中断、可离开页面」的，
+            所以必须给出进度文案，而不是只放一个转圈的按钮——
+            用户不知道还要等多久时，最可能的行为是连点或刷新。
+          -->
+          <el-alert
+            v-if="regenerating"
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+            title="正在重新生成分析结论"
+            :description="progressText"
+          />
+
           <el-skeleton v-if="loading" :rows="8" animated />
 
           <el-result
@@ -256,13 +351,12 @@ async function regenerate(): Promise<void> {
               </el-descriptions-item>
             </el-descriptions>
 
-            <el-alert
-              type="info"
-              :closable="false"
-              show-icon
-              style="margin-top: 16px"
-              title="本结论由程序基于公开数据生成，不构成投资建议。"
-            />
+            <!--
+              免责声明（M3）改成组件：措辞与个股页 AI 解读卡完全一致。
+              以前是散在各处的 el-alert，改一处忘一处，
+              而合规文本的特点就是「一个字都不能有差异」。
+            -->
+            <DisclaimerNote :compact="false" class="report__disclaimer" />
           </template>
 
           <el-empty v-else description="暂无分析结果" />
@@ -315,7 +409,7 @@ async function regenerate(): Promise<void> {
 
 .thesis {
   padding: 12px 14px;
-  background: #fafbfc;
+  background: var(--color-surface-muted);
   border-left: 3px solid var(--color-up);
   border-radius: var(--radius-sm);
 }
@@ -331,6 +425,16 @@ async function regenerate(): Promise<void> {
   line-height: 1.7;
 }
 
+/*
+  报告正文的免责声明：与结论之间留一条分隔线，
+  视觉上表示「以下是声明，不属于结论本身」。
+*/
+.report__disclaimer {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--color-border);
+}
+
 .panel {
   padding: 12px 14px;
   border: 1px solid var(--color-border);
@@ -338,11 +442,11 @@ async function regenerate(): Promise<void> {
 }
 
 .panel--bull {
-  background: rgba(217, 43, 43, 0.04);
+  background: var(--tint-up);
 }
 
 .panel--bear {
-  background: rgba(10, 158, 92, 0.05);
+  background: var(--tint-down);
 }
 
 .panel__title {

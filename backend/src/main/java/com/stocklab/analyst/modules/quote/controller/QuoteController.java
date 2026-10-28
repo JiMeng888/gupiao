@@ -11,6 +11,7 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 import com.stocklab.analyst.modules.quote.dto.CarouselItem;
 import com.stocklab.analyst.modules.quote.dto.MarketSourceStatus;
@@ -115,6 +116,20 @@ public class QuoteController {
         return ApiResult.ok(quoteService.topMovers(metricEnum, ascending, limit));
     }
 
+    @GetMapping("/sectors")
+    @RateLimit(RateLimitScope.LOOSE)
+    @Operation(summary = "板块榜单",
+            description = "按涨跌幅降序的行业板块前列条目，含上涨/下跌家数与领涨股。"
+                    + "上游不可用时返回 503，而不是给出编造的排序——理由见 "
+                    + "MarketDataProvider#acceptableAsFallback 的说明")
+    public ApiResult<List<Sector>> sectors(
+            @RequestParam(defaultValue = "10")
+            @Min(value = 1, message = "limit 至少为 1")
+            @Max(value = 20, message = "limit 最多为 20")
+            int limit) {
+        return ApiResult.ok(quoteService.sectors(limit));
+    }
+
     @GetMapping("/{code}")
     @RateLimit(RateLimitScope.LOOSE)
     @Operation(summary = "实时报价")
@@ -126,7 +141,10 @@ public class QuoteController {
 
     @GetMapping("/{code}/bars")
     @RateLimit(RateLimitScope.LOOSE)
-    @Operation(summary = "K 线", description = "支持日/周/月/60分/30分/15分/5分/1分/分时")
+    @Operation(summary = "K 线",
+            description = "支持分时/5日/日K/周K/月K/季K/年K/60分/30分/15分/5分/1分。"
+                    + "周期可用性因数据源而异：腾讯源只提供日/周/月与分时，"
+                    + "季/年与分钟级会逐级降级到下一个有能力的源")
     public ApiResult<List<Bar>> bars(
             @PathVariable String code,
 

@@ -85,9 +85,17 @@ public class CacheConfig {
                 .expireAfterWrite(Duration.ofSeconds(60))
                 .build());
 
+        // 板块榜单：只缓存聚合后的前 N 名，key 是 limit，容量极小。
+        // TTL 取 60 秒——盘中板块排名会变，但没人需要每秒刷新它。
+        cacheManager.registerCustomCache(CacheNames.SECTORS, Caffeine.newBuilder()
+                .maximumSize(20)
+                .recordStats()
+                .expireAfterWrite(Duration.ofSeconds(60))
+                .build());
+
         cacheManager.setCacheNames(List.of(
                 CacheNames.STOCK_LIST, CacheNames.QUOTE, CacheNames.BARS,
-                CacheNames.FUNDAMENTAL, CacheNames.NEWS));
+                CacheNames.FUNDAMENTAL, CacheNames.NEWS, CacheNames.SECTORS));
 
         return cacheManager;
     }

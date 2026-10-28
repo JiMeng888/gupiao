@@ -5,6 +5,43 @@
     <meta name="viewport" content="width=1280" />
     <title>股票分析师 · 行情与 AI 研判</title>
     <meta name="description" content="A 股行情、技术指标、财务基本面与 AI 辅助研判" />
+    <!--
+      移动端地址栏 / 状态栏底色。由 stores/theme.ts 在切换主题时同步改写，
+      否则深色主题下顶部会留一条突兀的白边。
+      这里的初值只是首屏兜底，真实值由 JS 写入。
+    -->
+    <meta name="theme-color" content="#ffffff" />
+    <script>
+      /*
+        首屏防闪（FOUC）。
+        主题在 Pinia store 初始化时才生效，而那已经是在 Vue 挂载之后——
+        深色用户会先看到一帧亮色页面再变暗。
+        因此这里用一段内联脚本在渲染前就把 data-theme 打上，
+        逻辑与 stores/theme.ts 的 readChoice() 保持一致。
+      */
+      ;(function () {
+        /*
+          这里的键名必须与 utils/storage.ts 里 storageKey('ui','theme') 的结果一致
+          （前缀 stocklab. + 模块@配置@版本）。内联脚本无法 import，
+          只能硬编码——改动 storageKey 的命名规则时记得同步这一行。
+        */
+        var KEY = 'stocklab.ui@theme@1.0.0'
+        try {
+          var raw = localStorage.getItem(KEY)
+          var dark = raw === 'dark'
+          if (raw !== 'dark' && raw !== 'light') {
+            dark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          }
+          if (dark) {
+            document.documentElement.setAttribute('data-theme', 'dark')
+          }
+          var meta = document.querySelector('meta[name="theme-color"]')
+          if (meta) meta.setAttribute('content', dark ? '#0e1013' : '#ffffff')
+        } catch (e) {
+          /* 忽略：读不到偏好就保持默认亮色 */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

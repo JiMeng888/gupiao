@@ -1,0 +1,96 @@
+# ---------------------------------------------------------------------------
+# 低配 / 免费主机专用编排：只有「后端 + 前端」两个容器
+#
+# 与 docker-compose.yml 的区别：
+#   主编排 = MySQL 8 + Redis 7 + 后端 + 前端（4 个容器，需 2 GB 以上）
+#   本编排 = 后端(lite profile, H2 文件库) + 前端(Nginx)（2 个容器，1 GB 可跑）
+#
+# 什么时候用本文件：
+#   - 免费/低配云主机（1~2 GB 内存）
+#   - 只想先看效果，不想为 MySQL/Redis 的安装与备份操心
+# 什么时候**不该**用：
+#   - 需要多实例/水平扩容（H2 文件库不支持并发多进程写）
+#   - 需要 Redis 共享的会话吊销与限流配额（多副本场景）
+#
+# 用法：
+#   cd deploy
+#   cp .env.example .env && vi .env      # 至少要填 JWT_SECRET 与 LLM_API_KEY
+#   docker compose -f docker-compose.lite.yml up -d --build
+#   浏览器打开 http://<主机IP>:${FRONTEND_PORT:-8088}
+#
+# 或者直接：./start.sh --lite
+# ---------------------------------------------------------------------------
+
+services:
+  backend:
+    build:
+      context: ../backend
+    container_name: stocklab-backend
+    restart: unless-stopped
+    environment:
+      # lite = H2 文件库，无 MySQL、无 Redis
+      SPRING_PROFILES_ACTIVE: lite
+      TZ: Asia/Shanghai
+
+      # H2 库文件目录。由下方命名卷挂载，容器重建后数据仍在。
+      # 备份就是 `docker cp stocklab-backend:/app/data/stockanalyst.mv.db .`
+      APP_DATA_DIR: /app/data
+
+      # 必须显式设置；缺失时应用启动即失败（这是有意的快速失败）
+      APP_JWT_SECRET: ${JWT_SECRET:?必须在 deploy/.env 中设置 JWT_SECRET（至少 32 字符）}
+
+      # 只读接口与写接口共用客户端 IP 分桶。不开这个的话，
+      # 后端看到的永远是 nginx 容器的内网 IP——所有外部用户共用一个桶，
+      # 严格桶 20 次/分钟会被几个人瞬间打满（表现为登录/AI 分析随机 429）。
+      # 前提：nginx.conf 已改为 X-Forwarded-For 覆盖（本仓库已改）。
+      RATE_LIMIT_TRUST_FORWARDED: "true"
+
+      # 免费主机若在境外，东财接口更容易被 IP 风控命中。
+      # 把腾讯提到第一位（腾讯的报价/K线/指数可用，但没有榜单与搜索能力）。
+      MARKET_DATA_CHAIN: ${MARKET_DATA_CHAIN:-eastmoney,tencent,tushare}
+
+      # 小堆 + 串行 GC：lite 的瓶颈是内存不是吞吐。
+      # 1 GB 机器建议改成 -Xmx320m -XX:MaxMetaspaceSize=160m。
+      JAVA_OPTS: ${LITE_JAVA_OPTS:--Xmx448m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:MaxMetaspaceSize=192m -XX:+ExitOnOutOfMemoryError}
+
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+
+      SPRING_H2_CONSOLE_ENABLED: "false"
+
+    # 内存上限。JVM 已用 -Xmx 显式限死，这里再加一道容器级保险，
+    # 避免堆外内存（Netty / Metaspace / 直接缓冲）把整台机器拖死。
+    mem_limit: ${LITE_BACKEND_MEM:-768m}
+
+    volumes:
+      - backend-data:/app/data
+
+    ports:
+      # 只绑回环地址：后端不直接对公网开放，外部一律经 nginx。
+      # 需要跑冒烟脚本时从宿主机 localhost:18080 访问；
+      # 远程调试请用 ssh -L 18080:localhost:18080。
+      - "127.0.0.1:${BACKEND_PORT:-18080}:8080"
+
+    networks: [stocklab]
+
+  frontend:
+    build:
+      context: ../frontend
+    container_name: stocklab-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-8088}:80"
+    mem_limit: ${LITE_FRONTEND_MEM:-64m}
+    networks: [stocklab]
+
+volumes:
+  backend-data:
+
+networks:
+  stocklab:
+    driver: bridge

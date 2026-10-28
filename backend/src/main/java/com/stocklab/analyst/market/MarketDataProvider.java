@@ -6,6 +6,7 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 
 import java.util.List;
@@ -131,6 +132,20 @@ public interface MarketDataProvider {
      * @param limit     期望条数，实现方负责收敛到合理区间（1..20）
      */
     List<Mover> getTopMovers(MoverMetric metric, boolean ascending, int limit);
+
+    /**
+     * 板块榜单：按涨跌幅排序的行业/概念板块前列条目。
+     *
+     * <p>默认实现是「如实不可用」（抛 {@code MarketDataUnavailableException}），
+     * 而不是返回空列表——这两者的区别很关键：空列表会被上层当成
+     * 「查了，今天确实没数据」，而实际上是「这个源根本没这项能力」。
+     * 后者必须让路由器知道，才能继续往降级链的下一级走。
+     *
+     * @param limit 期望条数，实现方负责收敛到合理区间（1..20）
+     */
+    default List<Sector> getSectors(int limit) {
+        throw new MarketDataUnavailableException("数据源 " + name() + " 不提供板块榜单");
+    }
 
     /**
      * 启动预热（可选）。

@@ -115,6 +115,17 @@ services:
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
 
+      # 降级链顺序。不在这里显式透传的话，.env 里写 MARKET_DATA_CHAIN 是**不生效**的：
+      # compose 只把 environment 里列出的变量注入容器，宿主机的同名变量不会自动进去。
+      # 境外主机上东财更容易被 IP 风控命中时，把它改成 tencent,eastmoney,tushare。
+      MARKET_DATA_CHAIN: ${MARKET_DATA_CHAIN:-eastmoney,tencent,tushare}
+
+      # 限流按客户端 IP 分桶。容器里后端只被 nginx 访问，
+      # getRemoteAddr() 拿到的是 nginx 内网 IP——不开这个开关，
+      # 所有外部用户共用一份额度（严格桶 20 次/分钟）。
+      # 安全前提：nginx.conf 用 $remote_addr **覆盖** X-Forwarded-For（本仓库已改）。
+      RATE_LIMIT_TRUST_FORWARDED: ${RATE_LIMIT_TRUST_FORWARDED:-true}
+
       # 容器内不用 H2 控制台
       SPRING_H2_CONSOLE_ENABLED: "false"
     ports:

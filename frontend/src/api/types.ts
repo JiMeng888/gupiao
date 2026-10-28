@@ -72,6 +72,15 @@ export interface Quote {
   amount: number
   /** epoch 秒 */
   ts: number
+  /** 总市值（元）。数据源未提供时为 null，前端应渲染 `--` 而不是 0。 */
+  marketCap?: number | null
+  /**
+   * 行情延迟分钟数（数据源声明值），0 表示实时。
+   *
+   * 合规要求：非实时行情必须在价格附近明示延迟时长，
+   * 因此这个值大于 0 时前端必须渲染「延迟 N 分钟」标注。
+   */
+  delayMinutes?: number
 }
 
 /** `GET /api/v1/quote/indices` */
@@ -107,6 +116,28 @@ export interface Mover {
   change: number
   changePct: number
   amount: number
+}
+
+/**
+ * `GET /api/v1/quote/sectors` —— 板块榜单条目。
+ *
+ * <p>涨跌幅是板块的聚合结果，涨跌家数是对它的自校验：
+ * 一个 +3% 但下跌家数远多于上涨家数的板块，说明内部严重分化。
+ */
+export interface Sector {
+  code: string
+  name: string
+  changePct: number
+  /** 成分股上涨家数；上游缺失时为 null */
+  upCount?: number | null
+  /** 成分股下跌家数；上游缺失时为 null */
+  downCount?: number | null
+  /** 领涨股名称；上游缺失时为 null */
+  leaderName?: string | null
+  /** 领涨股 6 位代码；上游缺失时为 null。有它才能从板块跳到个股 */
+  leaderCode?: string | null
+  /** 领涨股涨跌幅（百分比数值）；上游缺失时为 null */
+  leaderPct?: number | null
 }
 
 /** `GET /api/v1/quote/carousel` */
@@ -395,6 +426,31 @@ export interface AnalysisReport {
   notice: string | null
 }
 
+/**
+ * `POST /api/v1/analysis/{code}/async` 的响应。
+ *
+ * 请求线程只拿到一个 taskId 就结束了，真正耗时的大模型调用在后台进行。
+ * 前端据此轮询 {@link AnalysisTaskView} 直到终态。
+ */
+export interface AnalysisTaskSubmission {
+  taskId: string
+  /** 提交时的初始状态，恒为 `PENDING` */
+  status: AnalysisTaskStatus
+}
+
+/** 异步任务状态机，与后端 AnalysisTaskStatus 枚举一一对应。 */
+export type AnalysisTaskStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED'
+
+/** `GET /api/v1/analysis/tasks/{taskId}` */
+export interface AnalysisTaskView {
+  taskId: string
+  status: AnalysisTaskStatus
+  /** 仅 `SUCCESS` 时非空 */
+  report: AnalysisReport | null
+  /** 仅 `FAILED` 时非空 */
+  error: string | null
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket 协议（对应后端 WsProtocol）
 // ---------------------------------------------------------------------------
@@ -417,6 +473,18 @@ export interface WsQuoteFrame {
   /** epoch 秒 */
   ts: number
 }
+
+/**
+ * 报价快照：REST 报价与 WebSocket 推送帧的联合。
+ *
+ * <p>推送帧 {@link WsQuoteFrame} 少了 {@code exchange / marketCap / delayMinutes}
+ * 三个字段——它只负责价格。这里用联合类型而不是「把推送帧补全成 Quote」：
+ * 补全需要交易所、总市值这些信息，而推送里根本没有，
+ * 填上去就是编造。缺的字段在界面上一律显示 {@code --}。
+ *
+ * <p>消费方要读这三个字段时，用 {@code 'marketCap' in snapshot} 收窄。
+ */
+export type QuoteSnapshot = Quote | WsQuoteFrame
 
 export interface WsReadyFrame {
   type: 'ready'

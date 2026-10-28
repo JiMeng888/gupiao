@@ -9,18 +9,27 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 import com.stocklab.analyst.modules.quote.dto.CarouselItem;
 import com.stocklab.analyst.modules.quote.dto.MarketSourceStatus;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * 行情服务：把数据源能力编排成前端需要的视图数据。
@@ -61,12 +70,47 @@ public class QuoteService {
             "技术面出现买点信号",
             "市场情绪回暖");
 
+    /**
+     * 轮播并行取价的总时间预算（秒）。
+     *
+     * <p>个券的读超时是 6 秒（{@code app.market-data.timeout}），三级降级链最坏
+     * 会串行叠三次，所以理论上单只可能耗到十几秒。首页是首屏，
+     * 不该为「一个区块」等这么久——超预算就交付已取到的部分，
+     * 前端拿到少于 6 条时按实际条数渲染即可（它本来就允许条数不固定）。
+     */
+    private static final int CAROUSEL_FETCH_BUDGET_SECONDS = 12;
+
     private final MarketDataProvider marketDataProvider;
     private final MeterRegistry meterRegistry;
 
-    public QuoteService(MarketDataProvider marketDataProvider, MeterRegistry meterRegistry) {
+    /** 轮播取价用的线程池。与行情/资讯共用 {@code marketFetchExecutor}，都是 IO 密集型短任务。 */
+    private final Executor carouselFetchExecutor;
+
+    /** 轮播并行取价的总时间预算（秒），见 {@link #CAROUSEL_FETCH_BUDGET_SECONDS}。 */
+    private final int fetchBudgetSeconds;
+
+    @Autowired
+    public QuoteService(MarketDataProvider marketDataProvider,
+                        MeterRegistry meterRegistry,
+                        @Qualifier("marketFetchExecutor") Executor carouselFetchExecutor) {
+        this(marketDataProvider, meterRegistry, carouselFetchExecutor, CAROUSEL_FETCH_BUDGET_SECONDS);
+    }
+
+    /**
+     * 指定取价预算的构造器，仅供测试。
+     *
+     * <p>把预算做成可注入而不是常量，是因为「超预算就交付已有结果」这条分支
+     * 在生产配置下要等满 12 秒才走得到——那样的测试没人愿意跑，
+     * 最后就会变成一条永远不执行的路径。
+     */
+    QuoteService(MarketDataProvider marketDataProvider,
+                 MeterRegistry meterRegistry,
+                 Executor carouselFetchExecutor,
+                 int fetchBudgetSeconds) {
         this.marketDataProvider = marketDataProvider;
         this.meterRegistry = meterRegistry;
+        this.carouselFetchExecutor = carouselFetchExecutor;
+        this.fetchBudgetSeconds = Math.max(1, fetchBudgetSeconds);
     }
 
     public Quote getQuote(String code) {
@@ -117,6 +161,19 @@ public class QuoteService {
     }
 
     /**
+     * 板块榜单（按涨跌幅降序）。
+     *
+     * <p>不吞异常：真实源不可用时由 {@code MarketDataUnavailableException} 一路抛到
+     * Controller 映射为 503，前端据此展示「板块数据暂不可用」。
+     * 返回空列表会让前端无法区分「今天没有板块数据」与「上游故障」，
+     * 而这两种情况在界面上本就应该给出不同提示。
+     */
+    public List<Sector> sectors(int limit) {
+        int effectiveLimit = Math.min(Math.max(limit, 1), 20);
+        return marketDataProvider.getSectors(effectiveLimit);
+    }
+
+    /**
      * 首页精选关注数据。
      *
      * <p><b>为什么用「轮次」而不是时间戳</b>：首页每 10 秒换一批精选股，
@@ -145,8 +202,17 @@ public class QuoteService {
      * 当池子小到装不下两批互斥（{@code 2 × size + gap > 池大小}）时，
      * 退化为步长 {@code size}——至少保证集合在移动，不会原样返回。
      *
+     * <p><b>取价是并行的（相对首版的修正）</b>：首版用一个 for 循环逐个调
+     * {@code getQuote}，冷缓存时就是最多 10 次串行上游往返，首屏耗时等于
+     * 所有单只报价之和。现在提交到 {@code marketFetchExecutor} 并行取，
+     * 整块耗时降到「最慢的那一只」。并行不改变确定性：
+     * 结果按候选顺序回填，高亮文案的随机数也仍在规划阶段按同样顺序生成，
+     * 因此「同一天 + 同一轮次 → 完全一致」这条性质保持不变。
+     *
      * <p>单只股票取数失败只跳过该条，不影响整批返回——批量数据源里
      * 偶尔有个别标的拉不到是常态，不该让它拖垮整个首页区块。
+     * 整批还有一个总预算（{@value #CAROUSEL_FETCH_BUDGET_SECONDS} 秒），
+     * 防止个别上游卡住时把首页请求一起拖住。
      *
      * @param count 本次返回条数
      * @param round 轮次（自增整数；前端每 10 秒递增一次，不传默认第 0 轮）
@@ -170,21 +236,80 @@ public class QuoteService {
             picked.add(CAROUSEL_CANDIDATES.get(Math.floorMod(start + i, poolSize)));
         }
 
-        // 种子同样只由「日期 + 轮次」决定，保证 tag/文案与批次一一对应
+        // 种子同样只由「日期 + 轮次」决定，保证 tag/文案与批次一一对应。
+        // 注意 random 的消费顺序必须与 picked 顺序一致——挪到这里统一生成
+        // （而不是取价时生成），就是为了让并行取价不影响文案的确定性。
         Random random = new Random(epochDay * 1000L + step);
-        List<CarouselItem> items = new ArrayList<>(size);
-        for (String code : picked) {
-            try {
+        List<String> highlights = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            highlights.add(HIGHLIGHT_POOL.get(random.nextInt(HIGHLIGHT_POOL.size())));
+        }
+
+        // 先全部投递，再按顺序收集：投递完才 wait，才能真正重叠 IO
+        List<CompletableFuture<CarouselItem>> futures = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            futures.add(fetchCarouselItem(picked.get(i), highlights.get(i)));
+        }
+
+        return collectCarouselItems(futures, picked);
+    }
+
+    /** 投递单只标的的取价任务。任何投递期异常都转成「失败的结果」，不影响整批。 */
+    private CompletableFuture<CarouselItem> fetchCarouselItem(String code, String highlight) {
+        try {
+            return CompletableFuture.supplyAsync(() -> {
                 Quote quote = marketDataProvider.getQuote(code);
-                items.add(new CarouselItem(
+                return new CarouselItem(
                         quote.code(),
                         quote.name(),
                         quote.price(),
                         quote.change(),
                         quote.changePct(),
-                        HIGHLIGHT_POOL.get(random.nextInt(HIGHLIGHT_POOL.size()))));
-            } catch (RuntimeException ex) {
-                log.debug("精选关注取数跳过 {}：{}", code, ex.getMessage());
+                        highlight);
+            }, carouselFetchExecutor);
+        } catch (RuntimeException ex) {
+            // 线程池拒绝（AbortPolicy 会走到这里）等情况：只丢这一条，不炸整批
+            log.debug("精选关注投递失败 {}：{}", code, ex.getMessage());
+            return CompletableFuture.failedFuture(ex);
+        }
+    }
+
+    /**
+     * 按投递顺序收集结果，跳过失败项，并受总预算约束。
+     *
+     * <p>逐个 {@code get(remaining)} 而不是 {@code allOf().get()}：
+     * 前者能让「已经成功的」尽快进入结果，后者要等最慢的那个；
+     * 更重要的是后者一旦有一个任务卡住，整个接口就跟着卡住。
+     */
+    private List<CarouselItem> collectCarouselItems(List<CompletableFuture<CarouselItem>> futures,
+                                                    List<String> picked) {
+        List<CarouselItem> items = new ArrayList<>(futures.size());
+        long deadline = System.nanoTime() + Duration.ofSeconds(fetchBudgetSeconds).toNanos();
+        boolean budgetExhausted = false;
+
+        for (int i = 0; i < futures.size(); i++) {
+            if (budgetExhausted) {
+                break;
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                log.warn("精选关注取价超出 {} 秒总预算，返回已完成的 {} 条",
+                        fetchBudgetSeconds, items.size());
+                break;
+            }
+            try {
+                items.add(futures.get(i).get(remaining, TimeUnit.NANOSECONDS));
+            } catch (TimeoutException ex) {
+                // 预算用尽：不再等后面的（它们只会更晚），直接交付已有结果
+                log.warn("精选关注取价超时，返回已完成的 {} 条", items.size());
+                budgetExhausted = true;
+            } catch (ExecutionException ex) {
+                log.debug("精选关注取数跳过 {}：{}", picked.get(i), ex.getCause());
+            } catch (InterruptedException ex) {
+                // 恢复中断位：吞掉中断会让上层无法感知停机信号
+                Thread.currentThread().interrupt();
+                log.warn("精选关注取价被中断，返回已完成的 {} 条", items.size());
+                break;
             }
         }
         return items;

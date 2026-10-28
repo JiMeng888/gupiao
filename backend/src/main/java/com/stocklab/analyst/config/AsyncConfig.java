@@ -45,4 +45,35 @@ public class AsyncConfig {
         executor.initialize();
         return executor;
     }
+
+    /**
+     * AI 分析任务线程池：与行情拉取线程池<b>隔离</b>。
+     *
+     * <p>分析任务单次耗时 10~40 秒（大模型生成），远长于行情拉取的几十毫秒。
+     * 混在同一个池子里时，少数几个分析任务就会长时间占住行情线程，
+     * 把「行情页卡顿」和「分析变慢」两个互不相干的问题耦合在一起。
+     *
+     * <p>Bean 名刻意用 {@code analysisTaskThreadPool} 而不是 {@code analysisTaskExecutor}：
+     * 后者会与 {@code AnalysisTaskExecutor} 组件（类名首字母小写即同名）冲突，
+     * 触发 {@code BeanDefinitionOverrideException}。
+     *
+     * <p>拒绝策略刻意选 {@code CallerRunsPolicy} 之外的默认
+     * {@code AbortPolicy}：异步化之后，请求线程已经释放了，
+     * 没有「由调用者同步兜底」这个选项；任务满了应该明确拒绝（记 FAILED），
+     * 而不是让提交它的那一次 HTTP 请求替它等 40 秒——那等于异步化白做。
+     * 拒绝由 {@code AnalysisTaskExecutor} 捕获并写回任务 FAILED。
+     */
+    @Bean("analysisTaskThreadPool")
+    public ThreadPoolTaskExecutor analysisTaskThreadPool() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(4);
+        executor.setQueueCapacity(50);
+        executor.setKeepAliveSeconds(120);
+        executor.setThreadNamePrefix("analysis-task-");
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
 }

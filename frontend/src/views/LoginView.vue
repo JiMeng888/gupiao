@@ -157,7 +157,15 @@ function onTabChange(name: string | number): void {
   justify-content: center;
   min-height: 100vh;
   padding: 24px;
-  background: linear-gradient(135deg, #f5f6f8 0%, #eef2f7 100%);
+  /*
+    这里原来是写死的浅灰渐变（#f5f6f8 → #eef2f7），
+    深色主题下整页会变成一块白色，卡片里的浅色文字直接看不见。
+    改为「一层淡蓝光晕 + 主题底色」：亮色清爽，深色下光晕落在近黑底上，
+    也正好是登录页需要的聚焦感。
+  */
+  background:
+    radial-gradient(900px 520px at 18% -12%, rgba(77, 156, 240, 0.12), transparent 62%),
+    var(--color-bg);
 }
 
 .login-card {

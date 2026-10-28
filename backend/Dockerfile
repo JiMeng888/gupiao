@@ -28,7 +28,10 @@ FROM eclipse-temurin:21-jre-jammy
 
 # 时区显式设置为东八区：容器默认 UTC，日志时间与 K 线时间会对不上，
 # 排查「开盘前后数据异常」这类问题时会造成误导
+# SERVER_PORT 显式声明为 8080：PaaS 平台（Render / Koyeb / Railway 等）通常
+# 要求应用监听它们注入的 PORT，改这一个环境变量即可，不必改镜像。
 ENV TZ=Asia/Shanghai \
+    SERVER_PORT=8080 \
     JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+UseG1GC"
 
 WORKDIR /app
@@ -37,7 +40,12 @@ WORKDIR /app
 RUN groupadd -r app && useradd -r -g app app
 
 COPY --from=builder /build/target/stock-analyst-backend.jar app.jar
-RUN chown -R app:app /app
+
+# lite profile（免费/低配机器）的 H2 文件库落在 /app/data。
+# 这个目录必须先在镜像里建好并属于 app 用户：命名卷首次创建时会继承
+# 镜像内该路径的属主，否则卷是 root:root，非 root 进程写不进去，
+# 表现为启动即失败（H2 打不开库文件，日志里是 Permission denied）。
+RUN mkdir -p /app/data && chown -R app:app /app
 USER app
 
 EXPOSE 8080
@@ -47,9 +55,11 @@ EXPOSE 8080
 # 容器停止时会等在途请求处理完，而不是直接掐断。
 #
 # 健康检查打 /actuator/health；compose 里的 depends_on 也依赖它。
+# 端口用 ${SERVER_PORT} 而不是写死 8080，否则改端口后健康检查会一直失败。
 HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=5 \
-    CMD ["sh", "-c", "curl -fsS http://localhost:8080/actuator/health || exit 1"]
+    CMD ["sh", "-c", "curl -fsS http://localhost:${SERVER_PORT}/actuator/health || exit 1"]
 
 # 默认用 mysql profile：容器编排里一定是连真实数据库。
+# 低配/免费机器可用 SPRING_PROFILES_ACTIVE=lite（H2 文件库，无 MySQL/Redis）。
 # 环境变量（JWT_SECRET / DB_* / LLM_* 等）由 docker-compose 注入。
-ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar --spring.profiles.active=${SPRING_PROFILES_ACTIVE:-mysql}"]
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar --spring.profiles.active=${SPRING_PROFILES_ACTIVE:-mysql} --server.port=${SERVER_PORT:-8080}"]

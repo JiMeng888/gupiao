@@ -70,7 +70,12 @@ public record MarketSourceStatus(
     private static String displayNameOf(String provider) {
         return switch (provider == null ? "" : provider) {
             case "eastmoney" -> "东方财富（真实行情）";
+            case "tencent" -> "腾讯（真实行情）";
+            case "sina" -> "新浪（真实行情）";
+            case "tushare" -> "Tushare（授权数据）";
             case FALLBACK -> "内置演示数据";
+            // 未知标识原样返回而不是折成「未知数据源」：留着原始名字，
+            // 排查时能顺着它去改配置；折成「未知」等于把线索也一起丢了
             default -> provider;
         };
     }

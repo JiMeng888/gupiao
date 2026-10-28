@@ -12,9 +12,17 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -31,6 +39,15 @@ import static org.mockito.Mockito.when;
  * 这类问题只能靠对<b>集合关系</b>的断言发现，所以这里不测「返回了几条」，
  * 而是测「这批和上批是不是同一批股票」。
  *
+ * <p>第二组断言针对<b>并行取价</b>（取价从串行改成并行后新增）：
+ * 光看返回条数无法区分「串行取 10 次」和「并行取 10 次」——
+ * 两者最终都返回同样的 6 条。所以这里换个角度：
+ * <ul>
+ *   <li>用「闸门 Executor」卡住任务执行，断言 <b>6 个任务全部投递完才开始等</b>。
+ *       串行实现的投递数是 1，这条断言会直接失败。</li>
+ *   <li>用「预算 1 秒 + 上游卡 5 秒」，断言接口<b>快速返回部分结果</b>而不是被卡住。</li>
+ * </ul>
+ *
  * <p>测试用固定假数据源，避免依赖外部行情接口；股票名直接用代码回填，
  * 断言里只比对代码，不关心展示文案。
  */
@@ -44,7 +61,9 @@ class QuoteServiceTest {
 
     @BeforeEach
     void setUp() {
-        quoteService = new QuoteService(marketDataProvider, new SimpleMeterRegistry());
+        // 直通 Executor：让并行取价在测试里退化为「同线程顺序执行」，
+        // 保证既有的顺序性断言完全确定，不受线程调度影响。
+        quoteService = new QuoteService(marketDataProvider, new SimpleMeterRegistry(), Runnable::run);
     }
 
     /** 让任意代码都能取到报价，名称回填为「股票+代码」，方便断言。 */
@@ -195,6 +214,99 @@ class QuoteServiceTest {
                     .thenThrow(new IllegalStateException("数据源不可用"));
 
             assertThat(quoteService.getCarousel(6, 0)).isEmpty();
+        }
+    }
+
+    @Nested
+    @DisplayName("并行取价")
+    class Concurrency {
+
+        @Test
+        @DisplayName("先把整批任务全部投递出去，再开始等待——证明取价是并行而不是逐个等")
+        void submitsWholeBatchBeforeWaiting() throws Exception {
+            stubAllQuotesAvailable();
+
+            // 闸门 Executor：只收任务、不执行，便于在「投递阶段」观察投递数量
+            GatedExecutor gate = new GatedExecutor();
+            QuoteService service =
+                    new QuoteService(marketDataProvider, new SimpleMeterRegistry(), gate);
+
+            CompletableFuture<List<CarouselItem>> call =
+                    CompletableFuture.supplyAsync(() -> service.getCarousel(6, 0));
+
+            // 如果实现是「投递一个 → 等它完成 → 再投下一个」，这里最多只能看到 1 个
+            boolean allSubmitted = awaitSize(gate.queued, 6, 5_000);
+            assertThat(allSubmitted)
+                    .as("6 个取价任务应在等待任何结果之前全部投递（串行实现只会投递 1 个）")
+                    .isTrue();
+
+            // 放行后才可能有人开始等待，此时必须还没有结果
+            assertThat(call.isDone()).as("尚未执行任何任务，不应已有结果").isFalse();
+
+            gate.queued.forEach(Runnable::run);
+
+            assertThat(call.get(5, TimeUnit.SECONDS))
+                    .extracting(CarouselItem::code)
+                    .hasSize(6);
+        }
+
+        @Test
+        @DisplayName("上游卡住时按总预算快速返回，不把首页请求一起拖住")
+        void exceedingBudgetReturnsPartialResultQuickly() throws Exception {
+            CountDownLatch release = new CountDownLatch(1);
+            when(marketDataProvider.getQuote(anyString())).thenAnswer(invocation -> {
+                try {
+                    // 模拟上游不响应，直到测试结束才放行
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                }
+                String code = invocation.getArgument(0, String.class);
+                return new Quote(code, "股票" + code, "SH", 10.0, 0.1, 1.0,
+                        10.0, 10.2, 9.9, 9.9, 1000L, 1.0, 100000.0, 1700000000L);
+            });
+
+            ExecutorService pool = Executors.newFixedThreadPool(6);
+            try {
+                // 预算 1 秒：生产配置是 12 秒，做成可注入就是为了这条分支能被测到
+                QuoteService service =
+                        new QuoteService(marketDataProvider, new SimpleMeterRegistry(), pool, 1);
+
+                long startedAt = System.nanoTime();
+                List<CarouselItem> items = service.getCarousel(6, 0);
+                long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+
+                assertThat(items).as("上游全部未返回时应交付空结果而不是抛错").isEmpty();
+                assertThat(elapsedMs)
+                        .as("超出预算后应立即返回，实测耗时 %d ms", elapsedMs)
+                        .isLessThan(3_000);
+            } finally {
+                release.countDown();
+                pool.shutdownNow();
+            }
+        }
+
+        /** 只收不跑的 Executor，用于把「投递」与「执行」两个阶段分开观察。 */
+        private static final class GatedExecutor implements Executor {
+            private final List<Runnable> queued =
+                    Collections.synchronizedList(new ArrayList<>());
+
+            @Override
+            public void execute(Runnable command) {
+                queued.add(command);
+            }
+        }
+
+        private static boolean awaitSize(List<?> list, int expected, long timeoutMillis)
+                throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+            while (System.nanoTime() < deadline) {
+                if (list.size() >= expected) {
+                    return true;
+                }
+                Thread.sleep(10);
+            }
+            return list.size() >= expected;
         }
     }
 }

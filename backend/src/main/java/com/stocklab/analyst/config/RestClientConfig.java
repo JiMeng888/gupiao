@@ -2,6 +2,7 @@ package com.stocklab.analyst.config;
 
 import com.stocklab.analyst.config.properties.LlmProperties;
 import com.stocklab.analyst.config.properties.MarketDataProperties;
+import com.stocklab.analyst.config.properties.TushareProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpHeaders;
@@ -63,6 +64,34 @@ public class RestClientConfig {
      */
     @Bean("tencentRestClient")
     public RestClient tencentRestClient(MarketDataProperties properties) {
+        return buildClient(properties.timeout(), null);
+    }
+
+    /**
+     * 新浪行情客户端（榜单备用真实源）。
+     *
+     * <p>与 {@code newsRestClient} 分开而不是复用：那个 Bean 的职责是资讯 feed，
+     * 这个负责行情榜单。两者的上游站点、缓存与故障语义都不同，
+     * 合成一个实例会让「资讯源挂了要不要连累行情」变成一个只能靠读代码回答的问题。
+     *
+     * <p>Referer 用财经首页：实测该榜单接口不校验 Referer，
+     * 但新浪的行情族接口（如 {@code hq.sinajs.cn}）对 Referer 是敏感的，
+     * 统一带上比依赖对方的宽松策略可靠。
+     */
+    @Bean("sinaRestClient")
+    public RestClient sinaRestClient(MarketDataProperties properties) {
+        return buildClient(properties.timeout(), SINA_REFERER);
+    }
+
+    /**
+     * Tushare 数据源客户端（有授权协议的数据源）。
+     *
+     * <p>与其它行情源独立：Tushare 是 RESTful POST API（JSON body 带 Token），
+     * 不需要 Referer，超时也单独放宽到 {@code app.tushare.timeout}（日线批量查询
+     * 可能较慢，10 秒比行情源的 6 秒更合适）。
+     */
+    @Bean("tushareRestClient")
+    public RestClient tushareRestClient(TushareProperties properties) {
         return buildClient(properties.timeout(), null);
     }
 

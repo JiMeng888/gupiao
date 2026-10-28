@@ -3,12 +3,9 @@ package com.stocklab.analyst.modules.fundamental.service;
 import com.stocklab.analyst.common.constant.CacheNames;
 import com.stocklab.analyst.common.exception.BizException;
 import com.stocklab.analyst.common.exception.ErrorCode;
-import com.stocklab.analyst.market.MarketDataProvider;
 import com.stocklab.analyst.market.MarketDataUnavailableException;
 import com.stocklab.analyst.market.fundamental.EastMoneyFundamentalClient;
 import com.stocklab.analyst.market.fundamental.RawFinancialPeriod;
-import com.stocklab.analyst.market.fundamental.RawFundamental;
-import com.stocklab.analyst.market.model.Quote;
 import com.stocklab.analyst.modules.fundamental.dto.DupontAnalysis;
 import com.stocklab.analyst.modules.fundamental.dto.FinancialPeriodView;
 import com.stocklab.analyst.modules.fundamental.dto.FundamentalOverview;
@@ -20,20 +17,22 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * 基本面服务：财务指标概览、杜邦分析、业绩报表、同行对比。
  *
- * <h2>数据真实性约定</h2>
- * 财务数据与行情不同——行情错了用户一眼能看出，财务数据错了用户会当真。
- * 因此本服务遵循两条硬规则：
- * <ol>
- *   <li><b>能取真实数据就绝不用估算值。</b>真实数据来自东方财富<b>内部数据接口</b>
- *       （未获数据方授权，详见 {@code docs/数据来源与授权状态说明-20260924.md}）。</li>
- *   <li><b>使用估算值时必须在响应里标注。</b>{@code dataSource=estimated} 且
- *       {@code notice} 给出明确提示，前端必须显式展示该标识。</li>
- * </ol>
+ * <h2>分层：本类只做编排，取数在 {@link FundamentalOverviewProvider}</h2>
+ * 概览的取数与缓存已下沉到 {@code FundamentalOverviewProvider}。
+ * 这一点不只是整理代码结构，而是<b>修掉了一个静默失效的缓存</b>：
+ * 原先 {@code getOverview} 是本类的 {@code @Cacheable} 方法，
+ * 而本类的杜邦分析与同行对比在内部直接调用它——
+ * <b>同类内部调用不经过 Spring 的 AOP 代理，缓存注解直接无效</b>。
+ * 后果是 {@code /fundamental/compare} 一次请求最多放大成 12~18 次上游调用，
+ * 既慢又加剧东财的 IP 级风控。
+ *
+ * <p>现在三个入口（外部接口、杜邦、同行对比）走的是同一个代理，缓存无条件生效。
+ * 由此得到一个约定：<b>本类不要再出现「自己调自己」的取数方法</b>——
+ * 需要复用取数逻辑，就把它放进 {@code FundamentalOverviewProvider}。
  *
  * <h2>与业绩报表的差异处理</h2>
  * 概览与杜邦分析保留了估算值兜底（因为它们是页面首屏，离线演示需要内容），
@@ -46,30 +45,13 @@ public class FundamentalService {
 
     private static final Logger log = LoggerFactory.getLogger(FundamentalService.class);
 
-    private static final String SOURCE_REAL = "eastmoney";
-    private static final String SOURCE_ESTIMATED = "estimated";
-
-    /**
-     * 真实数据时的来源标注。措辞刻意区分两件事：
-     * <ul>
-     *   <li><b>内容层面</b>：财报是上市公司强制公开披露的信息，本身是公开的；</li>
-     *   <li><b>渠道层面</b>：我们是调东方财富给自家网页用的内部接口拿到的，未获授权。</li>
-     * </ul>
-     * 以前这里写的是「东方财富公开披露接口」，把「内容公开」和「接口获准」混成了一件事。
-     */
-    private static final String REAL_NOTICE =
-            "数据来源：东方财富内部数据接口（未获数据方授权）；财报内容为上市公司公开披露信息，"
-                    + "仅作研究参考，不构成投资建议";
-    private static final String ESTIMATED_NOTICE =
-            "当前为估算数据（未连接真实财务数据源），与实际财务状况无关，请勿据此决策";
-
+    private final FundamentalOverviewProvider overviewProvider;
     private final EastMoneyFundamentalClient fundamentalClient;
-    private final MarketDataProvider marketDataProvider;
 
-    public FundamentalService(EastMoneyFundamentalClient fundamentalClient,
-                              MarketDataProvider marketDataProvider) {
+    public FundamentalService(FundamentalOverviewProvider overviewProvider,
+                              EastMoneyFundamentalClient fundamentalClient) {
+        this.overviewProvider = overviewProvider;
         this.fundamentalClient = fundamentalClient;
-        this.marketDataProvider = marketDataProvider;
     }
 
     // ==================================================================
@@ -79,109 +61,13 @@ public class FundamentalService {
     /**
      * 财务指标概览。
      *
-     * <p>缓存 6 小时：财务数据按季度披露，日间不变；
-     * 而一次概览要打 2~3 个上游接口，不缓存会让每次页面访问都产生数倍延迟。
+     * <p><b>刻意不加 {@code @Cacheable}</b>：缓存属于取数层，由
+     * {@link FundamentalOverviewProvider#load} 承担。这里再加一层只会多一份
+     * key 与 TTL 要维护，而且会掩盖「内部调用绕过缓存」的问题——
+     * 外层有缓存时接口看起来正常，只有同行对比这类内部调用方在偷偷放大请求量。
      */
-    @Cacheable(cacheNames = CacheNames.FUNDAMENTAL, key = "'overview:' + #code", sync = true)
     public FundamentalOverview getOverview(String code) {
-        String name = resolveName(code);
-
-        try {
-            Optional<RawFundamental> raw = fundamentalClient.fetchFundamental(code);
-            if (raw.isPresent()) {
-                return buildFromReal(code, name, raw.get());
-            }
-            log.debug("上游无 {} 的财务数据，使用估算值", code);
-        } catch (MarketDataUnavailableException ex) {
-            log.warn("财务数据源不可用，{} 使用估算值：{}", code, ex.getMessage());
-        }
-        return buildEstimated(code, name);
-    }
-
-    private FundamentalOverview buildFromReal(String code, String fallbackName, RawFundamental raw) {
-        String name = raw.name() != null && !raw.name().isBlank() ? raw.name() : fallbackName;
-
-        // 行业名称与板块代码需要额外一次查询；取不到不影响主体指标
-        String industry = null;
-        Double industryPe = null;
-        try {
-            List<RawFinancialPeriod> periods = fundamentalClient.fetchFinancialPeriods(code, 1);
-            if (!periods.isEmpty()) {
-                RawFinancialPeriod latest = periods.get(0);
-                industry = latest.boardName();
-                Optional<EastMoneyFundamentalClient.BoardValuation> valuation =
-                        fundamentalClient.fetchBoardValuation(latest.boardCode());
-                if (valuation.isPresent()) {
-                    industryPe = valuation.get().pe();
-                    if (industry == null || industry.isBlank()) {
-                        industry = valuation.get().name();
-                    }
-                }
-            }
-        } catch (RuntimeException ex) {
-            log.debug("行业估值补充信息获取失败 code={}：{}", code, ex.getMessage());
-        }
-
-        Double pe = firstNonNull(raw.peTtm(), raw.peDynamic(), raw.peStatic());
-        Double premium = (pe != null && industryPe != null && industryPe > 0)
-                ? round2((pe - industryPe) / industryPe * 100)
-                : null;
-
-        return new FundamentalOverview(
-                code,
-                name,
-                industry,
-                raw.peDynamic(),
-                raw.peStatic(),
-                raw.peTtm(),
-                raw.pb(),
-                raw.roe(),
-                raw.grossMargin(),
-                raw.grossMarginApplicable(),
-                raw.netMargin(),
-                raw.debtRatio(),
-                raw.revenue(),
-                raw.netProfit(),
-                raw.revenueYoy(),
-                raw.netProfitYoy(),
-                raw.bps(),
-                raw.eps(),
-                industryPe,
-                premium,
-                SOURCE_REAL,
-                REAL_NOTICE);
-    }
-
-    /**
-     * 估算值兜底。
-     *
-     * <p>使用代码的稳定哈希生成「看起来合理」的数值，仅用于离线演示。
-     * 相比原 FastAPI 版本有一处修正：Python 的 {@code hash()} 对字符串
-     * 默认启用随机化（PYTHONHASHSEED），导致同一只股票的「财务数据」
-     * 每次重启都不同；这里用 Java 的 {@code String.hashCode()}
-     * （由语言规范保证稳定）作为种子，结果可复现。
-     *
-     * <p>散列取模用 {@link Math#floorMod} 而不是 {@code %}：
-     * Java 的 {@code %} 对负数返回负值，会让「ROE 出现负数」这种
-     * 与预期完全不符的结果。
-     */
-    private FundamentalOverview buildEstimated(String code, String name) {
-        int h = code.hashCode();
-        double pe = round2(20 + Math.floorMod(h, 150) / 10.0);
-        double pb = round2(2 + Math.floorMod(h, 70) / 10.0);
-        double roe = round2(15 + Math.floorMod(h, 200) / 10.0);
-        double grossMargin = round2(25 + Math.floorMod(h, 450) / 10.0);
-        double netMargin = round2(8 + Math.floorMod(h, 250) / 10.0);
-        double debtRatio = round2(20 + Math.floorMod(h, 400) / 10.0);
-
-        return new FundamentalOverview(
-                code, name, null,
-                pe, pe, pe, pb, roe,
-                grossMargin, true,
-                netMargin, debtRatio,
-                null, null, null, null,
-                null, null, null, null,
-                SOURCE_ESTIMATED, ESTIMATED_NOTICE);
+        return overviewProvider.load(code);
     }
 
     // ==================================================================
@@ -196,7 +82,7 @@ public class FundamentalService {
      */
     @Cacheable(cacheNames = CacheNames.FUNDAMENTAL, key = "'dupont:' + #code", sync = true)
     public DupontAnalysis getDupont(String code) {
-        FundamentalOverview overview = getOverview(code);
+        FundamentalOverview overview = overviewProvider.load(code);
 
         Double roe = overview.roe();
         Double netMargin = overview.netMargin();
@@ -255,7 +141,7 @@ public class FundamentalService {
      * <p>取不到数据时返回空列表，<b>不编造</b>——理由见类注释。
      */
     public StatementsResponse getStatements(String code, int periods) {
-        String name = resolveName(code);
+        String name = overviewProvider.resolveName(code);
         String industry = null;
         List<FinancialPeriodView> views = new ArrayList<>();
 
@@ -290,7 +176,7 @@ public class FundamentalService {
                         + "A 股财报为年内累计值，趋势比较请使用同一报告期口径";
 
         return new StatementsResponse(code, name, industry,
-                views.isEmpty() ? "unavailable" : SOURCE_REAL, views, notice);
+                views.isEmpty() ? "unavailable" : FundamentalOverviewProvider.SOURCE_REAL, views, notice);
     }
 
     // ==================================================================
@@ -302,6 +188,9 @@ public class FundamentalService {
      *
      * <p>上限 6 只：每个标的都要打上游接口，不做限制时一次请求
      * 传 50 个代码会变成 150 次上游调用，既慢又容易被限流。
+     *
+     * <p>这里的每一只都走 {@link FundamentalOverviewProvider#load}，
+     * 也就是都经过缓存代理——重复对比同一组标的（刷新页面、切回来）不会重复打上游。
      */
     public List<FundamentalOverview> compare(String codes) {
         if (codes == null || codes.isBlank()) {
@@ -323,31 +212,12 @@ public class FundamentalService {
 
         List<FundamentalOverview> result = new ArrayList<>(codeList.size());
         for (String code : codeList) {
-            result.add(getOverview(code));
+            result.add(overviewProvider.load(code));
         }
         return result;
     }
 
     // ==================================================================
-
-    /** 名称优先从行情源取；失败则退回代码本身，保证接口不因取名失败而报错。 */
-    private String resolveName(String code) {
-        try {
-            Quote quote = marketDataProvider.getQuote(code);
-            return quote.name();
-        } catch (RuntimeException ex) {
-            return code;
-        }
-    }
-
-    private static Double firstNonNull(Double... values) {
-        for (Double value : values) {
-            if (value != null) {
-                return value;
-            }
-        }
-        return null;
-    }
 
     private static double round2(double value) {
         return Math.round(value * 100.0) / 100.0;

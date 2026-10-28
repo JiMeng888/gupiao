@@ -12,6 +12,7 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,13 +23,16 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.net.URI;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -57,14 +61,21 @@ import java.util.Map;
  *   <li>分时：{@code GET web.ifzq.gtimg.cn/appstock/app/minute/query}，
  *       每项 {@code HHMM 价格 累计量(手) 累计额(元)}，量额需要自行差分</li>
  *   <li>指数：{@code qt.gtimg.cn/q=s_sh000001,...} 简版格式</li>
+ *   <li>行业板块：{@code proxy.finance.qq.com/cgi/cgi-bin/rank/pt/getRank}，
+ *       31 个一级行业的涨跌幅、涨跌家数与领涨股（<b>UTF-8 JSON</b>，
+ *       与本类其它 GBK 文本接口不是同一套解码路径）</li>
  * </ul>
  *
  * <h2>能力边界（如实声明）</h2>
- * 腾讯行情接口（内部接口，未获授权）<b>不提供</b>全市场模糊搜索与涨跌/成交额榜单，
- * 这两个方法抛 {@link MarketDataUnavailableException}，
+ * 腾讯行情接口（内部接口，未获授权）<b>不提供</b>全市场模糊搜索与
+ * 涨跌/成交额<b>个股</b>榜单，这两个方法抛 {@link MarketDataUnavailableException}，
  * 由降级路由交给下一级（搜索在东财不可用时落 mock 内置清单）。
  * 这不是缺陷而是一种诚实：与其在这里塞一个只能搜到内置清单的假搜索，
  * 不如让路由如实选择真正能服务的源。
+ *
+ * <p>板块榜单<b>是</b>例外：本源提供一级行业板块榜，而且口径比东财的
+ * 496 个混层级板块更适合作榜单，因此板块操作的默认优先链是腾讯在前
+ * （见 {@link #getSectors(int)}）。
  *
  * <h2>两个实现层面的坑，本类已处理</h2>
  * <ol>
@@ -83,6 +94,23 @@ public class TencentMarketDataProvider implements MarketDataProvider {
 
     private static final String HOST_QUOTE = "https://qt.gtimg.cn";
     private static final String HOST_KLINE = "https://web.ifzq.gtimg.cn";
+
+    /** 板块榜单接口所在域（与行情/K 线不同域，且返回 UTF-8 JSON 而非 GBK 文本）。 */
+    private static final String HOST_RANK = "https://proxy.finance.qq.com";
+
+    /**
+     * 板块榜单单次拉取的条数。
+     *
+     * <p><b>接口没有可用的排序参数</b>：{@code sort_type} 传 {@code price} 时返回顺序
+     * 与涨跌幅无关（实测 2026-10-21：第一页是 -1.65 / -1.65 / -0.11 / -3.67 / +0.79），
+     * 传其它值（{@code zdf}、{@code zsz} 等）直接返回错误码与空列表。
+     * 因此只能<b>把全量拿回来自己排序</b>——一级行业共 31 个，一次请求即可覆盖，
+     * 成本可以忽略。这里的 100 是「全量 + 余量」，不是「分页大小」。
+     */
+    private static final int SECTOR_FETCH_COUNT = 100;
+
+    /** 板块榜单对外返回的条数上限，与个股榜单保持一致（前端最多展示 20 条）。 */
+    private static final int SECTOR_MAX_LIMIT = 20;
 
     private static final Charset GBK = Charset.forName("GBK");
 
@@ -207,7 +235,36 @@ public class TencentMarketDataProvider implements MarketDataProvider {
                 volume,
                 turnover,
                 amount,
-                ts);
+                ts,
+                marketCapFrom(f),
+                // 延迟声明由容灾链路统一盖章，这里固定 0（本源无自带延迟）
+                0);
+    }
+
+    /**
+     * 解析腾讯返回的总市值。
+     *
+     * <p>上游在索引 45 给出总市值，单位是「亿元」，而 {@link Quote#marketCap}
+     * 的口径是「元」，因此这里做 ×1e8 换算。口径不统一是本类最容易出错的地方：
+     * 成交额在索引 37 是「万元」，总市值却是「亿元」——两处单位不同，
+     * 照抄其中一个必然错一个数量级。
+     *
+     * <p>字段缺失或不是数字时返回 {@code null}，前端渲染 {@code --}。
+     * 不用 0 兜底：0 会被显示成「总市值 0 元」，看起来像数据，其实是缺失。
+     */
+    private static Double marketCapFrom(String[] f) {
+        if (f.length <= 45) {
+            return null;
+        }
+        String raw = f[45];
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        double hundredMillion = parseDouble(raw, Double.NaN);
+        if (!Double.isFinite(hundredMillion) || hundredMillion <= 0) {
+            return null;
+        }
+        return hundredMillion * 100_000_000d;
     }
 
     // ==================================================================
@@ -228,8 +285,10 @@ public class TencentMarketDataProvider implements MarketDataProvider {
         return switch (period) {
             case DAILY, WEEKLY, MONTHLY -> fetchDailyKline(qtCode, period, limit);
             case TREND -> fetchTrend(qtCode, limit);
+            // 分钟级、季 K、年 K 一并拒绝。措辞不能写死成「不提供分钟级」——
+            // 季/年走同一个分支，那样报错文案会指错原因，排查时白绕一圈
             default -> throw new MarketDataUnavailableException(
-                    "腾讯源不提供分钟级 K 线（period=" + period.name() + " " + code + "）");
+                    "腾讯源不提供该周期 K 线（period=" + period.name() + " " + code + "）");
         };
     }
 
@@ -400,6 +459,185 @@ public class TencentMarketDataProvider implements MarketDataProvider {
     }
 
     // ==================================================================
+    // 板块榜单
+    // ==================================================================
+
+    /**
+     * 板块榜单：按涨跌幅降序的<b>一级行业</b>。
+     *
+     * <h2>为什么板块榜默认以腾讯为准，而不是以东财为准</h2>
+     * 东财行业板块接口（{@code m:90+t:2}）返回 <b>496</b> 个板块，把一级、二级、
+     * 三级混在同一个列表里，而响应中<b>没有任何字段标明层级</b>。直接按涨跌幅
+     * 排序得到的榜单是这样的（2026-10-21 实测）：
+     * <pre>
+     *   广告媒体 +6.85%（仅 3 只成分股）   其他数字媒体 +6.61%（2 只）
+     *   电视广播Ⅲ +3.26% 与 电视广播Ⅱ +3.26% 并列出现
+     *   林业Ⅲ 与 林业Ⅱ、IT服务Ⅲ 与 IT服务Ⅱ 同理
+     * </pre>
+     * 两个后果：榜单头部被「只有两三只票」的微板块长期占据，且同一板块以
+     * 不同层级重复出现。这对「资金在往哪个方向去」没有解释力——两只票涨停
+     * 就能让一个板块 +6.6%。
+     *
+     * <p>腾讯这里给的是 31 个一级行业（食品饮料 / 电子 / 电力设备 …），
+     * 口径统一、成分股规模相当，天然可比。所以板块榜的默认优先链是
+     * {@code tencent → eastmoney}（{@code app.market-data.sector-chain}）。
+     * 它<b>只影响这一个操作</b>：报价、K 线、搜索仍按主链走——
+     * 全局链顺序不该为一个操作的口径问题被改掉。
+     *
+     * <h2>上游字段</h2>
+     * <pre>
+     *   name  板块名 / zdf 涨跌幅 / zgb 涨跌家数（"37/122" = 涨 37 家、跌 122 家）
+     *   lzg   领涨股：name 名称 / code 带市场前缀（sh605388）/ zdf 涨跌幅
+     *   total 板块总数（行业板块恒为 31）
+     * </pre>
+     * {@code zgb} / {@code lzg} 都可能缺失，此时如实给 {@code null}，
+     * 由前端渲染「—」——补 0 会得到「0 / 0」这种看起来正常其实无意义的比例。
+     */
+    @Override
+    @Cacheable(cacheNames = CacheNames.SECTORS, key = "'tencent:' + #limit", sync = true)
+    public List<Sector> getSectors(int limit) {
+        int effectiveLimit = Math.min(Math.max(limit, 1), SECTOR_MAX_LIMIT);
+        String url = HOST_RANK + "/cgi/cgi-bin/rank/pt/getRank"
+                + "?board_type=hy&sort_type=price&direct=down"
+                + "&offset=0&count=" + SECTOR_FETCH_COUNT;
+
+        JsonNode root = fetchJsonUtf8(url, "板块榜单", "hy");
+        List<Sector> result = parseSectorRank(root);
+        if (result.isEmpty()) {
+            // 空列表意味着「上游这次没给」，抛不可用交给路由降级到下一级，
+            // 而不是返回空集合让前端以为「今天没有板块数据」
+            throw new MarketDataUnavailableException("腾讯板块榜单返回空数据");
+        }
+        return result.size() > effectiveLimit
+                ? List.copyOf(result.subList(0, effectiveLimit))
+                : result;
+    }
+
+    /**
+     * 解析板块榜单响应并按涨跌幅降序排序。
+     *
+     * <p>包级可见，便于用真实响应样本直接做单测（不需要起本地 HTTP 服务）。
+     *
+     * <p>三处刻意的取舍：
+     * <ul>
+     *   <li><b>缺涨跌幅的条目直接丢弃</b>，不是当 0 参与排序——把缺数据的板块
+     *       放进涨幅榜，会被读成「今天平盘」，那是编造信息；</li>
+     *   <li><b>排序在这里做</b>：上游顺序与涨跌幅无关（见 {@link #SECTOR_FETCH_COUNT}），
+     *       前端只是消费方，不该被迫知道「这个榜单其实没排序」；</li>
+     *   <li><b>并列名次保持上游顺序</b>：{@code List#sort} 是稳定排序，
+     *       涨跌幅相同时不打乱同分板块的相对位置，结果可复现。</li>
+     * </ul>
+     */
+    static List<Sector> parseSectorRank(JsonNode root) {
+        JsonNode list = root == null ? null : root.path("data").path("rank_list");
+        if (list == null || !list.isArray() || list.isEmpty()) {
+            return List.of();
+        }
+        List<Sector> parsed = new ArrayList<>(list.size());
+        for (JsonNode item : list) {
+            String code = textOrNull(item, "code");
+            String name = textOrNull(item, "name");
+            Double changePct = readNullableDouble(item, "zdf");
+            if (code == null || name == null || changePct == null) {
+                continue;
+            }
+            Integer[] breadth = parseBreadth(textOrNull(item, "zgb"));
+            JsonNode leader = item.path("lzg");
+            parsed.add(new Sector(
+                    code,
+                    name,
+                    changePct,
+                    breadth[0],
+                    breadth[1],
+                    textOrNull(leader, "name"),
+                    stripMarketPrefix(textOrNull(leader, "code")),
+                    readNullableDouble(leader, "zdf")));
+        }
+        parsed.sort(Comparator.comparingDouble(Sector::changePct).reversed());
+        return Collections.unmodifiableList(parsed);
+    }
+
+    /** {@code "37/122"} → {37, 122}；形态不符时返回 {null, null}，不猜。 */
+    private static Integer[] parseBreadth(String raw) {
+        if (raw == null) {
+            return new Integer[] {null, null};
+        }
+        String[] parts = raw.trim().split("/");
+        if (parts.length != 2) {
+            return new Integer[] {null, null};
+        }
+        return new Integer[] {parseNullableInt(parts[0]), parseNullableInt(parts[1])};
+    }
+
+    private static Integer parseNullableInt(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty() || "-".equals(trimmed)) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(trimmed);
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+
+    /**
+     * 领涨股代码去掉市场前缀：{@code sh605388} → {@code 605388}。
+     *
+     * <p>只接受 6 位 A 股代码：上游偶尔给空串或 {@code "-"}，
+     * 交 {@code null} 比交半截字符串安全——前端拿到半截代码会拼出一个
+     * 请求不到任何东西的链接，看起来像「链接坏了」而不是「上游没给」。
+     */
+    static String stripMarketPrefix(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim().toLowerCase(Locale.ROOT);
+        String code = trimmed.length() > 2
+                && (trimmed.startsWith("sh") || trimmed.startsWith("sz") || trimmed.startsWith("bj"))
+                ? trimmed.substring(2)
+                : trimmed;
+        return StockCodes.isSixDigitCode(code) ? code : null;
+    }
+
+    private static String textOrNull(JsonNode node, String field) {
+        if (node == null) {
+            return null;
+        }
+        JsonNode value = node.path(field);
+        if (!value.isString()) {
+            return null;
+        }
+        String raw = value.asString().trim();
+        return raw.isEmpty() || "-".equals(raw) ? null : raw;
+    }
+
+    private static Double readNullableDouble(JsonNode node, String field) {
+        if (node == null) {
+            return null;
+        }
+        JsonNode value = node.path(field);
+        if (value.isNumber()) {
+            return value.asDouble();
+        }
+        if (value.isString()) {
+            String raw = value.asString().trim();
+            if (raw.isEmpty() || "-".equals(raw)) {
+                return null;
+            }
+            try {
+                return Double.valueOf(raw);
+            } catch (NumberFormatException ex) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    // ==================================================================
     // 能力边界：如实声明不提供的能力
     // ==================================================================
 
@@ -459,6 +697,15 @@ public class TencentMarketDataProvider implements MarketDataProvider {
      * 任何一层消息转换器按默认字符集（ISO-8859-1）处理都会把股票名变成乱码。
      */
     private String fetchText(String url, String action, String subject) {
+        return fetchText(url, action, subject, GBK);
+    }
+
+    /** 指定字符集的文本拉取。GBK 只属于 {@code qt.gtimg.cn}，不要扩散到 JSON 接口。 */
+    private String fetchText(String url, String action, String subject, Charset charset) {
+        return new String(fetchBytes(url, action, subject), charset);
+    }
+
+    private byte[] fetchBytes(String url, String action, String subject) {
         byte[] bytes;
         try {
             bytes = restClient.get().uri(URI.create(url)).retrieve().body(byte[].class);
@@ -469,13 +716,31 @@ public class TencentMarketDataProvider implements MarketDataProvider {
         if (bytes == null || bytes.length == 0) {
             throw new MarketDataUnavailableException("行情上游返回空响应（" + action + " " + subject + "）");
         }
-        return new String(bytes, GBK);
+        return bytes;
     }
 
     private JsonNode fetchJson(String url, String action, String subject) {
         String body = fetchText(url, action, subject);
         try {
             return objectMapper.readTree(body);
+        } catch (RuntimeException ex) {
+            throw new MarketDataUnavailableException(
+                    "行情上游响应不是合法 JSON（" + action + " " + subject + "）", ex);
+        }
+    }
+
+    /**
+     * 按 UTF-8 拉取并解析 JSON。
+     *
+     * <p><b>不能复用 {@link #fetchJson}</b>：那条路径固定按 GBK 解码，
+     * 因为 {@code qt.gtimg.cn} 是 GBK 文本协议；而板块接口返回的是
+     * {@code Content-Type: application/json}。按 GBK 解不会报错，
+     * 只会把「食品饮料」安静地变成乱码——接口照样 200，这类错误最难发现。
+     */
+    private JsonNode fetchJsonUtf8(String url, String action, String subject) {
+        byte[] bytes = fetchBytes(url, action, subject);
+        try {
+            return objectMapper.readTree(new String(bytes, StandardCharsets.UTF_8));
         } catch (RuntimeException ex) {
             throw new MarketDataUnavailableException(
                     "行情上游响应不是合法 JSON（" + action + " " + subject + "）", ex);

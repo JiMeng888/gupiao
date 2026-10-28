@@ -6,6 +6,8 @@ import ChangeText from '@/components/ChangeText.vue'
 import SectionCarousel from '@/components/SectionCarousel.vue'
 import { newsApi, quoteApi } from '@/api/endpoints'
 import { useMarketSourceStore } from '@/stores/marketSource'
+import { providerLabel, servingProvider } from '@/utils/marketSourceLabels'
+import { track } from '@/utils/track'
 import type { CarouselItem, IndexSnapshot, Mover, NewsItem } from '@/api/types'
 import { formatEpochSeconds } from '@/api/types'
 
@@ -34,6 +36,8 @@ const indices = ref<IndexSnapshot[]>([])
 const picks = ref<CarouselItem[]>([])
 const news = ref<NewsItem[]>([])
 const gainers = ref<Mover[]>([])
+/** 涨幅榜单独的重试态：不与首页整体的 `loading` 混用，否则点重试会整页变骨架 */
+const moversLoading = ref(false)
 const loading = ref(true)
 
 /** 首页区块标识，用于按块记录失败原因。 */
@@ -117,6 +121,51 @@ function formatAmountYi(amount: number): string {
   if (!amount) return '--'
   return (amount / 1e8).toFixed(2) + ' 亿'
 }
+
+/**
+ * 拉取今日涨幅榜（前 10）。
+ *
+ * <p>单独抽成函数只为了一件事：<b>失败后用户能重试</b>。
+ * 榜单的 503 有两种成因——「两家真实榜单源同时故障」与「后端配置成离线演示」，
+ * 前者重试一次就可能恢复，后者重试也不会变。此前这个区块失败后
+ * 只留一张空图加一行原因，用户除了刷新整页没有别的操作。
+ *
+ * <p>失败时<b>保留上一批数据</b>：与精选关注同理，偶发失败清空列表
+ * 会变成「闪一下变空再变回来」，比显示略旧的榜单更糟。
+ */
+async function loadMovers(): Promise<void> {
+  moversLoading.value = true
+  try {
+    gainers.value = await quoteApi.movers('changePct', 'desc', 10)
+    errors.value.gainers = null
+  } catch (e) {
+    errors.value.gainers = e instanceof Error ? e.message : '榜单数据暂不可用'
+  } finally {
+    moversLoading.value = false
+  }
+}
+
+/** 重试涨幅榜；顺带刷新数据源状态，让来源标注跟着变。 */
+function retryMovers(): void {
+  track('home.movers.retry')
+  void loadMovers()
+  void source.refresh()
+}
+
+/**
+ * 本区块实际由哪个源服务。
+ *
+ * <p>榜单有独立的优先链（`movers-chain`，默认 东财 → 新浪），
+ * 因此它和顶栏的「主数据源」本来就可能不同。降级到新浪属于
+ * <b>备用真实源接管</b>，`degraded` 为 false、不弹警示横幅，
+ * 但来源仍然需要标出来——否则「榜单里的股票和昨天不是一批」无从解释。
+ */
+const moversSource = computed(() => servingProvider(source.status, 'getTopMovers'))
+const moversSourceText = computed(() => {
+  const label = providerLabel(moversSource.value)
+  return label ? `数据源：${label}` : null
+})
+const moversSourceIsDemo = computed(() => moversSource.value === 'mock')
 
 onMounted(async () => {
   loading.value = true
@@ -291,18 +340,33 @@ function openStock(code: string): void {
     <section class="card" style="margin-top: 16px">
       <div class="card__header">
         <span class="card__title">今日涨幅榜</span>
-        <!-- 失败时不显示「共 0 只」——那读起来像「今天没有上涨的股票」，
-             而真实原因往往是上游不可用。两件事必须说清楚。 -->
-        <span v-if="errors.gainers" class="muted" style="font-size: 12px">
-          暂不可用
-        </span>
-        <span v-else class="muted" style="font-size: 12px">
-          共 {{ gainersCount }} 只 · 点击卡片查看详情
+        <span class="mover__meta">
+          <!--
+            来源标注：榜单有自己的优先链（东财 → 新浪），降级到新浪时
+            degraded 为 false、不会弹横幅，但来源必须标出来，否则
+            「榜单里的股票怎么换了一批」永远解释不清。
+          -->
+          <el-tag
+            v-if="moversSourceText"
+            size="small"
+            :type="moversSourceIsDemo ? 'danger' : 'info'"
+            effect="plain"
+          >
+            {{ moversSourceText }}
+          </el-tag>
+          <!-- 失败时不显示「共 0 只」——那读起来像「今天没有上涨的股票」，
+               而真实原因往往是上游不可用。两件事必须说清楚。 -->
+          <span v-if="errors.gainers" class="muted" style="font-size: 12px">
+            暂不可用
+          </span>
+          <span v-else class="muted" style="font-size: 12px">
+            共 {{ gainersCount }} 只 · 点击卡片查看详情
+          </span>
         </span>
       </div>
       <div class="card__body">
         <SectionCarousel
-          :loading="loading"
+          :loading="loading || moversLoading"
           :count="gainersCount"
           :interval="4000"
           height="92px"
@@ -333,7 +397,22 @@ function openStock(code: string): void {
             <el-skeleton :rows="3" animated />
           </template>
           <template #empty>
-            <el-empty :description="errors.gainers ?? '榜单数据暂不可用'" :image-size="72" />
+            <!--
+              错误态带重试：榜单的 503 可能是「两家真实源同时故障」（重试有机会恢复），
+              也可能是「后端配置成离线演示」（重试也不会变）。前者占多数，
+              而此前用户唯一能做的就是刷新整页。
+            -->
+            <div class="mover__empty">
+              <el-empty :description="errors.gainers ?? '榜单数据暂不可用'" :image-size="60" />
+              <el-button
+                v-if="errors.gainers"
+                size="small"
+                :loading="moversLoading"
+                @click="retryMovers"
+              >
+                重试
+              </el-button>
+            </div>
           </template>
         </SectionCarousel>
       </div>
@@ -405,7 +484,7 @@ function openStock(code: string): void {
 }
 
 .pick:hover {
-  background: #fafbfc;
+  background: var(--color-surface-muted);
   border-color: var(--color-up);
 }
 
@@ -468,7 +547,7 @@ function openStock(code: string): void {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #c9cdd4;
+  background: var(--color-border-strong);
   transition: background 0.2s ease, box-shadow 0.2s ease;
 }
 
@@ -507,6 +586,25 @@ function openStock(code: string): void {
 }
 
 /** 涨幅榜单张卡片：名次 + 名称代码 + 价与涨跌幅 */
+/* 卡片头右侧的「来源 + 条数」组合。用 flex 而不是靠空格，
+   否则标签与文字在窄屏上会折成两行 */
+.mover__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 失败态：空图 + 重试按钮居中竖排。空态默认带 72px 插图，
+   在这个 92px 高的轮播里会顶到边缘，因此模板里降到 60px */
+.mover__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 0 10px;
+}
+
 .mover {
   display: flex;
   align-items: center;
@@ -520,7 +618,7 @@ function openStock(code: string): void {
 }
 
 .mover:hover {
-  background: #fafbfc;
+  background: var(--color-surface-muted);
   border-color: var(--color-up);
 }
 

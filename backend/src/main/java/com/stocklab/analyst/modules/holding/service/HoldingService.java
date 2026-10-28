@@ -104,7 +104,13 @@ public class HoldingService {
         double costTotal = 0;
         double dayPnl = 0;
         int counted = 0;
+        int totalCount = 0;
         for (HoldingView holding : holdings) {
+            // 持仓只数只取决于股数，与行情是否取到无关：
+            // 行情整体不可用时它仍然是真实只数，调用方据此区分「空仓」与「行情暂不可用」
+            if (holding.shares() > 0) {
+                totalCount++;
+            }
             if (holding.marketValue() == null) {
                 // 行情缺失的持仓不计入市值，否则会被当成 0 市值，
                 // 让总收益率凭空变负
@@ -118,7 +124,7 @@ public class HoldingService {
         double pnl = marketValue - costTotal;
         double pnlPct = costTotal == 0 ? 0 : pnl / costTotal * 100;
 
-        return new PortfolioSummary(counted, round2(marketValue), round2(costTotal),
+        return new PortfolioSummary(counted, totalCount, round2(marketValue), round2(costTotal),
                 round2(pnl), round2(pnlPct), round2(dayPnl));
     }
 
@@ -348,7 +354,7 @@ public class HoldingService {
             pnl = marketValue - costTotal;
             pnlPct = costTotal == 0 ? 0 : pnl / costTotal * 100;
             // 只在使用真实行情时才算当日盈亏；卖出响应的 quote 是成交价代理，不能用来算
-            dayPnl = computeDayPnl ? shares * (currentPrice - quote.prevClose()) : null;
+            dayPnl = computeDayPnl ? dayPnlOf(shares, currentPrice, quote.prevClose()) : null;
         } else if (shares > 0) {
             // 无行情时至少给出成本，前端可以显示「--」占位
             costTotal = shares * avgCost;
@@ -371,6 +377,26 @@ public class HoldingService {
                 round2OrNull(dayPnl),
                 realizedPnl,
                 soldShares);
+    }
+
+    /**
+     * 当日盈亏 = 股数 ×（现价 − 昨收）。
+     *
+     * <h2>为什么昨收为 0 时返回 null 而不是照算</h2>
+     * 部分数据源（如腾讯）在拿不到昨收字段时会把它解析成 0 而不是报错——
+     * 0 在这里是「缺失」的哨兵值，不是一个真实价格。若照代公式，
+     * 结果会变成 {@code 股数 × 现价}：以 1000 股 / 现价 12 元为例，
+     * 本该是几百元的当日盈亏会被放大成 12000 元，而且接口照常返回 200，
+     * 日志一行错误都没有——这正是「给出错误的数字」比报错更糟的情形。
+     *
+     * <p>因此昨收缺失（{@code <= 0}）时返回 {@code null}，前端渲染 {@code --}，
+     * 语义是「此刻不知道」，而不是「今天涨了 12 块」。
+     */
+    private static Double dayPnlOf(int shares, double currentPrice, double prevClose) {
+        if (prevClose <= 0) {
+            return null;
+        }
+        return shares * (currentPrice - prevClose);
     }
 
     private String resolveName(String provided, String code) {

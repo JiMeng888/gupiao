@@ -234,22 +234,30 @@ async function removeHolding(h: HoldingView): Promise<void> {
 </template>
 
 <style scoped>
+/* 组合总览的四个指标格。
+   深色下这四块是页面的视觉重心，间距和字号要撑得住：
+   原来 10px 内边距 + 18px 数值，四块挤在一起像贴纸；
+   放宽到 14/16px、数值 20px，块与块之间才有呼吸。 */
 .metric {
-  padding: 10px 12px;
-  background: #fafbfc;
+  padding: 14px 16px;
+  background: var(--color-surface-muted);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
 }
 
 .metric__label {
   font-size: 12px;
+  letter-spacing: 0.02em;
   color: var(--color-text-secondary);
 }
 
 .metric__value {
-  font-size: 18px;
+  margin-top: 6px;
+  font-size: 20px;
   font-weight: 600;
-  margin-top: 2px;
+  line-height: 1.3;
+  /* 大号数字收紧字距，避免「-1533.18」看起来松散 */
+  letter-spacing: -0.01em;
   display: flex;
   align-items: baseline;
   gap: 8px;

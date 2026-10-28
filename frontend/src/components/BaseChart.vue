@@ -1,50 +1,9 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
-import * as echarts from 'echarts/core'
-import { BarChart, CandlestickChart, LineChart } from 'echarts/charts'
-import {
-  AxisPointerComponent,
-  DataZoomComponent,
-  GridComponent,
-  LegendComponent,
-  TooltipComponent,
-} from 'echarts/components'
-import { CanvasRenderer } from 'echarts/renderers'
+// 从统一入口拿已注册好模块的 echarts（见 charts/echarts.ts 的说明）
+import { echarts } from '@/charts/echarts'
 // 仅类型导入，编译后被完全擦除，不会把全量包带回来。
 import type { EChartsOption } from 'echarts'
-
-/**
- * ECharts 按需注册。
- *
- * <p>改成按需之前这里是 `import * as echarts from 'echarts'`，打包后 echarts
- * chunk 为 1117 kB / gzip 370 kB——而项目只用到蜡烛图、折线、柱状三种系列。
- *
- * <p><b>这份清单必须与视图里的 option 一一对应，漏一个的后果是运行时报错
- * 而不是编译报错</b>：少注册 `CandlestickChart` 会得到
- * 「Series candlestick is used but not imported」，少注册 `GridComponent`
- * 则整个直角坐标系不渲染（图表一片空白）。因此新增图表类型时，
- * 除了写 option，还要回到这里补注册。
- *
- * 当前对应关系（见 {@code StockDetailView.vue}）：
- *   - 系列 candlestick / line / bar
- *   - 组件 tooltip（axisPointer 的 cross 依赖 AxisPointerComponent）、
- *     legend、grid（含 xAxis / yAxis）、dataZoom（inside 与 slider 两种）
- *   - 渲染器 Canvas
- *
- * `showLoading('default')` 用的默认加载动效在 echarts/core 里自带
- * （lib/core/echarts.js 直接 import 了 loading/default），无需额外注册。
- */
-echarts.use([
-  BarChart,
-  CandlestickChart,
-  LineChart,
-  AxisPointerComponent,
-  DataZoomComponent,
-  GridComponent,
-  LegendComponent,
-  TooltipComponent,
-  CanvasRenderer,
-])
 
 /**
  * ECharts 容器。
@@ -102,11 +61,39 @@ onMounted(init)
 
 watch(() => props.option, render, { deep: true })
 
+/**
+ * ECharts 的 loading 遮罩与文字不吃 CSS 变量，只能取出当前主题的值再塞进去。
+ *
+ * <p>写死 {@code rgba(255,255,255,0.6)} 的后果是：深色页面上加载图表时
+ * 会闪出一整块白蒙层，比不加遮罩还刺眼。文字同理——默认是黑色，
+ * 压在深色蒙层上等于隐身。
+ */
+function chartLoadingStyle(): {
+  text: string
+  color: string
+  textColor: string
+  maskColor: string
+} {
+  if (typeof window === 'undefined') {
+    return { text: '加载中', color: '#409eff', textColor: '#4e5969', maskColor: 'rgba(255,255,255,0.65)' }
+  }
+  const styles = getComputedStyle(document.documentElement)
+  const read = (name: string, fallback: string): string =>
+    styles.getPropertyValue(name).trim() || fallback
+  return {
+    text: '加载中',
+    // 转圈用主色，文字用页面当前的主题文本色
+    color: read('--el-color-primary', '#409eff'),
+    textColor: read('--chart-text', '#4e5969'),
+    maskColor: read('--chart-loading-mask', 'rgba(255,255,255,0.65)'),
+  }
+}
+
 watch(
   () => props.loading,
   (v) => {
     if (!chart.value) return
-    if (v) chart.value.showLoading('default', { text: '加载中', maskColor: 'rgba(255,255,255,0.6)' })
+    if (v) chart.value.showLoading('default', chartLoadingStyle())
     else chart.value.hideLoading()
   },
 )

@@ -5,10 +5,15 @@ import com.stocklab.analyst.common.exception.ErrorCode;
 import com.stocklab.analyst.market.MarketDataProvider;
 import com.stocklab.analyst.market.model.Quote;
 import com.stocklab.analyst.modules.analysis.dto.AnalysisReport;
+import com.stocklab.analyst.modules.analysis.dto.AnalysisTaskSubmission;
+import com.stocklab.analyst.modules.analysis.dto.AnalysisTaskView;
+import com.stocklab.analyst.modules.analysis.entity.AnalysisTask;
+import com.stocklab.analyst.modules.analysis.entity.AnalysisTaskStatus;
 import com.stocklab.analyst.modules.analysis.support.AiReportArchiver;
+import com.stocklab.analyst.modules.analysis.support.AnalysisGenerator;
 import com.stocklab.analyst.modules.analysis.support.AnalysisInput;
 import com.stocklab.analyst.modules.analysis.support.AnalysisInputLoader;
-import com.stocklab.analyst.modules.analysis.support.LlmJsonParser;
+import com.stocklab.analyst.modules.analysis.support.AnalysisTaskStore;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -17,8 +22,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.json.JsonMapper;
 
 import java.util.List;
 import java.util.Optional;
@@ -34,20 +37,16 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
- * {@link AnalysisService} 编排层单测——钉住「读存档还是重新生成」这条分支判定。
+ * {@link AnalysisService} 编排层单测——钉住「读存档还是重新生成」与「同步/异步」的分支判定。
  *
- * <p>协作者（取数 / 提示词 / 解析 / 兜底报告 / 存档）在拆分时已经各自有测试
- * （见 support 包下三个测试类），这里只测<b>分支决策本身</b>：
+ * <p>协作者（取数 / 生成 / 兜底报告 / 存档）各自有测试，这里只测<b>分支决策本身</b>：
  * <ul>
  *   <li>存档命中且未要求强刷 → 直接返回存档，一分钱模型费用都不花；</li>
  *   <li>{@code forceRefresh} → 忽略存档，重新生成并归档；</li>
  *   <li>取不到报价 → 在进入模型调用<b>之前</b>就 404（不存在的代码不烧钱）；</li>
- *   <li>模型失败 → 降级规则化报告，且失败原因必须带到响应里，不能静默。</li>
+ *   <li>模型失败 → 降级规则化报告，且失败原因必须带到响应里，不能静默；</li>
+ *   <li>异步提交 → 创建任务并投递执行器，立即返回 taskId。</li>
  * </ul>
- *
- * <p>这类判定失效时接口照样返回 200，日志一行 ERROR 都没有——
- * 存档逻辑坏了表现为「每次都重新生成，账单变贵」，降级坏了表现为
- * 「用户把规则化文案当成大模型分析」。只有对分支本身的断言能拦住。
  */
 @ExtendWith(MockitoExtension.class)
 class AnalysisServiceOrchestrationTest {
@@ -59,11 +58,13 @@ class AnalysisServiceOrchestrationTest {
     @Mock
     private AnalysisInputLoader inputLoader;
     @Mock
-    private LlmClient llmClient;
-    @Mock
-    private LlmJsonParser jsonParser;
+    private AnalysisGenerator generator;
     @Mock
     private AiReportArchiver archiver;
+    @Mock
+    private AnalysisTaskStore taskStore;
+    @Mock
+    private AnalysisTaskExecutor taskExecutor;
 
     private SimpleMeterRegistry meterRegistry;
     private AnalysisService service;
@@ -72,7 +73,7 @@ class AnalysisServiceOrchestrationTest {
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
         service = new AnalysisService(
-                marketDataProvider, inputLoader, llmClient, jsonParser, archiver, meterRegistry);
+                marketDataProvider, inputLoader, generator, archiver, taskStore, taskExecutor);
     }
 
     // ------------------------------------------------------------------
@@ -96,12 +97,15 @@ class AnalysisServiceOrchestrationTest {
                 List.of("实时报价"), "存档 notice");
     }
 
-    /** 走到生成分支所需的最小桩：报价可用、取数成功、模型未配置。 */
+    /** 走到生成分支所需的最小桩：报价可用、取数成功、生成器返回规则化报告。 */
     private void stubGenerationPathWithLlmDisabled() {
         Quote q = quote(CODE);
         when(marketDataProvider.getQuote(CODE)).thenReturn(q);
         when(inputLoader.load(eq(CODE), any(Quote.class))).thenReturn(input(q));
-        when(llmClient.enabled()).thenReturn(false);
+        when(generator.generate(any())).thenReturn(
+                new AnalysisReport(CODE, "股票" + CODE, "2026-09-20T10:00:00+08:00",
+                        "规则论点", List.of("b1"), List.of("r1"), List.of("risk"),
+                        "估值", "操作", "rule-based", false, List.of("实时报价"), "规则化"));
     }
 
     // ------------------------------------------------------------------
@@ -111,7 +115,7 @@ class AnalysisServiceOrchestrationTest {
     class ArchiveBranching {
 
         @Test
-        @DisplayName("存档命中时直接返回，不取数、不调模型、不写存档")
+        @DisplayName("存档命中时直接返回，不取数、不生成、不写存档")
         void archiveHitSkipsEverything() {
             AnalysisReport archived = archivedReport(CODE);
             when(archiver.loadLatest(CODE)).thenReturn(Optional.of(archived));
@@ -119,8 +123,8 @@ class AnalysisServiceOrchestrationTest {
             AnalysisReport result = service.analyze(CODE, "u1", false);
 
             assertThat(result).isSameAs(archived);
-            // 核心：一次存档命中意味着零次上游取数、零次模型调用、零次写库
-            verifyNoInteractions(marketDataProvider, inputLoader, llmClient);
+            // 核心：一次存档命中意味着零次上游取数、零次生成、零次写库
+            verifyNoInteractions(marketDataProvider, inputLoader, generator);
             verify(archiver, never()).archive(anyString(), anyString(), any());
         }
 
@@ -162,7 +166,7 @@ class AnalysisServiceOrchestrationTest {
                     .isInstanceOf(BizException.class)
                     .hasMessageContaining("hello");
 
-            verifyNoInteractions(marketDataProvider, inputLoader, llmClient, archiver);
+            verifyNoInteractions(marketDataProvider, inputLoader, generator, archiver, taskStore, taskExecutor);
         }
 
         @Test
@@ -177,71 +181,101 @@ class AnalysisServiceOrchestrationTest {
                     .extracting(ex -> ((BizException) ex).getCode())
                     .isEqualTo(ErrorCode.QUOTE_NOT_FOUND.name());
 
-            // 断钱断在取报价这一步：后面的取数、模型、归档都不该发生
-            verifyNoInteractions(inputLoader, llmClient);
+            // 断钱断在取报价这一步：后面的取数、生成、归档都不该发生
+            verifyNoInteractions(inputLoader, generator);
             verify(archiver, never()).archive(anyString(), anyString(), any());
-        }
-
-        @Test
-        @DisplayName("大模型失败降级为规则化报告，失败原因写入 notice 并计数")
-        void llmFailureDegradesWithVisibleReason() {
-            when(archiver.loadLatest(CODE)).thenReturn(Optional.empty());
-            Quote q = quote(CODE);
-            when(marketDataProvider.getQuote(CODE)).thenReturn(q);
-            when(inputLoader.load(eq(CODE), any(Quote.class))).thenReturn(input(q));
-            when(llmClient.enabled()).thenReturn(true);
-            when(llmClient.complete(anyString(), anyString()))
-                    .thenThrow(new BizException(ErrorCode.LLM_UPSTREAM_ERROR, "大模型调用失败（HTTP 502）"));
-
-            AnalysisReport result = service.analyze(CODE, "u1", false);
-
-            // 降级不能伪装成功：model 与 notice 都必须如实标注
-            assertThat(result.model()).isEqualTo("rule-based");
-            assertThat(result.notice()).contains("大模型调用失败");
-            // 降级必须可观测：指标带上错误码，运维能在监控里看到降级率
-            assertThat(meterRegistry.counter("app.analysis.fallback", "reason",
-                    ErrorCode.LLM_UPSTREAM_ERROR.name()).count()).isEqualTo(1.0);
-        }
-
-        @Test
-        @DisplayName("大模型未配置时直接走规则化，不产生失败计数")
-        void llmDisabledIsNotAFailure() {
-            stubGenerationPathWithLlmDisabled();
-
-            AnalysisReport result = service.analyze(CODE, "u1", true);
-
-            assertThat(result.model()).isEqualTo("rule-based");
-            assertThat(result.notice()).contains("未配置");
-            assertThat(meterRegistry.find("app.analysis.fallback").meter()).isNull();
         }
     }
 
     @Nested
-    @DisplayName("大模型成功路径与历史查询")
-    class LlmSuccessAndHistory {
+    @DisplayName("异步提交与任务查询")
+    class AsyncSubmission {
 
         @Test
-        @DisplayName("大模型成功时报告带模型名且 fromArchive=false")
-        void llmSuccessProducesFreshReport() {
-            when(archiver.loadLatest(CODE)).thenReturn(Optional.empty());
-            Quote q = quote(CODE);
-            when(marketDataProvider.getQuote(CODE)).thenReturn(q);
-            when(inputLoader.load(eq(CODE), any(Quote.class))).thenReturn(input(q));
-            when(llmClient.enabled()).thenReturn(true);
-            when(llmClient.modelName()).thenReturn("qwen-plus");
-            when(llmClient.complete(anyString(), anyString())).thenReturn("{}");
-            JsonNode node = JsonMapper.builder().build().readTree(
-                    "{\"thesis\":\"看好\",\"bullCase\":[\"b1\",\"b2\"],\"bearCase\":[],"
-                            + "\"risks\":[\"r1\"],\"valuationNote\":\"v\",\"actionHint\":\"a\"}");
-            when(jsonParser.parse("{}")).thenReturn(node);
+        @DisplayName("提交创建任务、投递执行器，并返回 taskId")
+        void submitCreatesTaskAndDispatches() {
+            when(taskStore.create(CODE, "u1")).thenReturn("task-123");
 
-            AnalysisReport result = service.analyze(CODE, "u1", false);
+            AnalysisTaskSubmission submission = service.submit(CODE, "u1");
 
-            assertThat(result.model()).isEqualTo("qwen-plus");
-            assertThat(result.fromArchive()).isFalse();
-            assertThat(result.thesis()).isEqualTo("看好");
-            assertThat(result.bullCase()).containsExactly("b1", "b2");
+            assertThat(submission.taskId()).isEqualTo("task-123");
+            assertThat(submission.status()).isEqualTo("PENDING");
+            // 关键：任务投递给了执行器，但执行器不阻塞提交线程（submit 立即返回）
+            verify(taskExecutor).submit("task-123", CODE, "u1");
+            // 异步路径不应触碰同步路径的取报价/取数/归档
+            verifyNoInteractions(marketDataProvider, inputLoader, archiver);
         }
+
+        @Test
+        @DisplayName("非法代码提交时直接 404，不创建任务")
+        void submitInvalidCodeDoesNotCreateTask() {
+            assertThatThrownBy(() -> service.submit("hello", "u1"))
+                    .isInstanceOf(BizException.class)
+                    .hasMessageContaining("hello");
+
+            verifyNoInteractions(taskStore, taskExecutor);
+        }
+
+        @Test
+        @DisplayName("查询不存在的任务返回 404")
+        void taskNotFoundReturns404() {
+            when(taskStore.findOwnedById("nope", "u1")).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.task("nope", "u1"))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getCode())
+                    .isEqualTo(ErrorCode.ANALYSIS_TASK_NOT_FOUND.name());
+        }
+
+        @Test
+        @DisplayName("查询 RUNNING 任务返回状态、无报告")
+        void runningTaskReturnsStatusOnly() {
+            AnalysisTask task = new AnalysisTask();
+            task.setId("task-1");
+            task.setStatus(AnalysisTaskStatus.RUNNING.name());
+            when(taskStore.findOwnedById("task-1", "u1")).thenReturn(Optional.of(task));
+
+            AnalysisTaskView view = service.task("task-1", "u1");
+
+            assertThat(view.status()).isEqualTo(AnalysisTaskStatus.RUNNING);
+            assertThat(view.report()).isNull();
+        }
+
+        @Test
+        @DisplayName("查询 SUCCESS 任务返回报告")
+        void successTaskReturnsReport() {
+            AnalysisTask task = new AnalysisTask();
+            task.setId("task-2");
+            task.setStatus(AnalysisTaskStatus.SUCCESS.name());
+            when(taskStore.findOwnedById("task-2", "u1")).thenReturn(Optional.of(task));
+            when(taskStore.parseReport(task)).thenReturn(archivedReport(CODE));
+
+            AnalysisTaskView view = service.task("task-2", "u1");
+
+            assertThat(view.status()).isEqualTo(AnalysisTaskStatus.SUCCESS);
+            assertThat(view.report()).isNotNull();
+            assertThat(view.report().code()).isEqualTo(CODE);
+        }
+
+        @Test
+        @DisplayName("查询他人任务：归属条件传给存储层，查不到即 404（对象级越权防护）")
+        void taskQueryIsScopedToOwner() {
+            when(taskStore.findOwnedById("task-1", "u1")).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.task("task-1", "u1"))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getCode())
+                    .isEqualTo(ErrorCode.ANALYSIS_TASK_NOT_FOUND.name());
+
+            // 归属条件必须真的传下去：这里验证查询用的是「ID + 提交者」而不是只按 ID
+            verify(taskStore).findOwnedById("task-1", "u1");
+            verify(taskStore, never()).findById(anyString());
+        }
+    }
+
+    @Nested
+    @DisplayName("历史查询")
+    class History {
 
         @Test
         @DisplayName("history 的 limit 被夹在 [1, MAX_HISTORY] 区间")

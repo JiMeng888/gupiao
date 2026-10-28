@@ -9,6 +9,7 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 
 import java.time.DayOfWeek;
@@ -51,16 +52,16 @@ public class MockMarketDataProvider implements MarketDataProvider {
     private static final Map<String, StockSeed> STOCK_POOL = new LinkedHashMap<>();
 
     static {
-        STOCK_POOL.put("600519", new StockSeed("贵州茅台", Exchange.SH, 1685.00));
-        STOCK_POOL.put("000858", new StockSeed("五粮液", Exchange.SZ, 138.20));
-        STOCK_POOL.put("300750", new StockSeed("宁德时代", Exchange.SZ, 198.50));
-        STOCK_POOL.put("600036", new StockSeed("招商银行", Exchange.SH, 38.20));
-        STOCK_POOL.put("601318", new StockSeed("中国平安", Exchange.SH, 52.85));
-        STOCK_POOL.put("600030", new StockSeed("中信证券", Exchange.SH, 24.66));
-        STOCK_POOL.put("002594", new StockSeed("比亚迪", Exchange.SZ, 246.30));
-        STOCK_POOL.put("000001", new StockSeed("平安银行", Exchange.SZ, 11.40));
-        STOCK_POOL.put("600887", new StockSeed("伊利股份", Exchange.SH, 28.90));
-        STOCK_POOL.put("688981", new StockSeed("中芯国际", Exchange.SH, 52.10));
+        STOCK_POOL.put("600519", new StockSeed("贵州茅台", Exchange.SH, 1685.00, "白酒"));
+        STOCK_POOL.put("000858", new StockSeed("五粮液", Exchange.SZ, 138.20, "白酒"));
+        STOCK_POOL.put("300750", new StockSeed("宁德时代", Exchange.SZ, 198.50, "电池"));
+        STOCK_POOL.put("600036", new StockSeed("招商银行", Exchange.SH, 38.20, "银行"));
+        STOCK_POOL.put("601318", new StockSeed("中国平安", Exchange.SH, 52.85, "保险"));
+        STOCK_POOL.put("600030", new StockSeed("中信证券", Exchange.SH, 24.66, "证券"));
+        STOCK_POOL.put("002594", new StockSeed("比亚迪", Exchange.SZ, 246.30, "汽车整车"));
+        STOCK_POOL.put("000001", new StockSeed("平安银行", Exchange.SZ, 11.40, "银行"));
+        STOCK_POOL.put("600887", new StockSeed("伊利股份", Exchange.SH, 28.90, "食品加工"));
+        STOCK_POOL.put("688981", new StockSeed("中芯国际", Exchange.SH, 52.10, "半导体"));
     }
 
     /** 演示指数：code -> {名称, 基准点位}。 */
@@ -105,7 +106,9 @@ public class MockMarketDataProvider implements MarketDataProvider {
      */
     @Override
     public boolean acceptableAsFallback(String action) {
-        return !"getTopMovers".equals(action);
+        // 板块榜单与个股榜单同属「排序结果」，降级时一并拒绝。
+        // 见 getSectors 的说明：名次携带判断，编造的排序比乱码更危险
+        return !"getTopMovers".equals(action) && !"getSectors".equals(action);
     }
 
     @Override
@@ -151,8 +154,10 @@ public class MockMarketDataProvider implements MarketDataProvider {
         int effectiveLimit = Math.min(Math.max(limit, 1), 500);
 
         return switch (period) {
-            case DAILY, WEEKLY, MONTHLY -> generateDaily(parsed.code(), seed, effectiveLimit, period);
-            case TREND, MIN1, MIN5, MIN15, MIN30, MIN60 -> generateIntraday(parsed.code(), seed, effectiveLimit, period);
+            case DAILY, WEEKLY, MONTHLY, QUARTERLY, YEARLY ->
+                    generateDaily(parsed.code(), seed, effectiveLimit, period);
+            case TREND, MIN1, MIN5, MIN15, MIN30, MIN60 ->
+                    generateIntraday(parsed.code(), seed, effectiveLimit, period);
         };
     }
 
@@ -219,6 +224,72 @@ public class MockMarketDataProvider implements MarketDataProvider {
     }
 
     /**
+     * 演示板块榜单：由 10 只演示股票按其行业分组聚合得出。
+     *
+     * <p><b>为什么演示模式下仍然要有板块，但降级模式下拒绝提供</b>：
+     * 两者的区别是「用户是否被明确告知」。离线演示模式下界面语义就是
+     * 「这是演示数据」，板块榜是完整产品形态的一部分；
+     * 而降级路径下用户以为自己在看真实行情，此时给出由随机数排出的名次
+     * 会造成实际误导。因此这里只在演示源作为主数据源时生效，
+     * 作为降级兜底时被 {@link #acceptableAsFallback} 挡掉。
+     *
+     * <p>涨跌幅取组内成分股涨跌幅的<b>等权平均</b>而非加权——
+     * 演示池没有真实市值/权重数据，等权是唯一不引入额外虚构量的算法。
+     */
+    @Override
+    public List<Sector> getSectors(int limit) {
+        int effectiveLimit = Math.min(Math.max(limit, 1), MAX_MOVERS_LIMIT);
+
+        Map<String, List<Double>> pctByIndustry = new LinkedHashMap<>();
+        for (Map.Entry<String, StockSeed> entry : STOCK_POOL.entrySet()) {
+            Quote quote = getQuote(entry.getKey());
+            pctByIndustry
+                    .computeIfAbsent(entry.getValue().industry(), key -> new ArrayList<>())
+                    .add(quote.changePct());
+        }
+
+        return pctByIndustry.entrySet().stream()
+                .map(entry -> {
+                    List<Double> pcts = entry.getValue();
+                    double average = pcts.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+                    long up = pcts.stream().filter(pct -> pct > 0).count();
+                    long down = pcts.stream().filter(pct -> pct < 0).count();
+                    String[] leader = leaderOf(entry.getKey());
+                    return new Sector(
+                            // 演示代码用行业名的哈希，稳定且可复现；真实板块代码形如 BK1295
+                            "DEMO-" + Math.abs(entry.getKey().hashCode() % 10_000),
+                            entry.getKey(),
+                            round2(average),
+                            (int) up,
+                            (int) down,
+                            leader[0],
+                            leader[1],
+                            pcts.stream().mapToDouble(Double::doubleValue).max().orElse(0));
+                })
+                .sorted(Comparator.comparingDouble(Sector::changePct).reversed())
+                .limit(effectiveLimit)
+                .toList();
+    }
+
+    /**
+     * 板块领涨股：组内涨幅最高的那只演示股票，返回 {@code {名称, 代码}}。
+     *
+     * <p>名称与代码一起返回，而不是分两个方法各算一遍——两次计算之间
+     * 行情时间片可能切换，会出现「名称是 A、代码是 B」的错配。
+     */
+    private String[] leaderOf(String industry) {
+        return STOCK_POOL.entrySet().stream()
+                .filter(entry -> industry.equals(entry.getValue().industry()))
+                .map(entry -> {
+                    Quote quote = getQuote(entry.getKey());
+                    return new Object[] { entry.getValue().name(), entry.getKey(), quote.changePct() };
+                })
+                .max(Comparator.comparingDouble(row -> (Double) row[2]))
+                .map(row -> new String[] { (String) row[0], (String) row[1] })
+                .orElse(new String[] { null, null });
+    }
+
+    /**
      * 生成日线序列。
      *
      * <p>与原实现一致：用正弦项叠加随机扰动构造有趋势感的走势，
@@ -229,10 +300,17 @@ public class MockMarketDataProvider implements MarketDataProvider {
         int step = switch (period) {
             case WEEKLY -> 5;
             case MONTHLY -> 21;
+            case QUARTERLY -> 63;
+            case YEARLY -> 242;
             default -> 1;
         };
-        // 先按日线生成足够根数，再按周期抽样
-        int dailyCount = limit * step;
+        // 先按日线生成足够根数，再按周期抽样。
+        //
+        // 上限 3000 个交易日（约 12 年）是必要的：季 K 的 step=63、年 K 的 step=242，
+        // 按 180 根去乘会把日期推回几十年甚至上百年，而演示数据只要求「形态像样」。
+        // 副作用是长周期拿到的根数少于请求数（年 K 约 12 根），这恰好和真实行情一致——
+        // 上市十几年的公司本来也只有十几根年 K。
+        int dailyCount = Math.min(limit * step, 3000);
         Random random = new Random(codeSeed(code));
         double base = seed.basePrice();
         double price = base * (1 - random.nextDouble(0.1, 0.25));
@@ -385,7 +463,13 @@ public class MockMarketDataProvider implements MarketDataProvider {
         return Math.round(value * 100.0) / 100.0;
     }
 
-    private record StockSeed(String name, Exchange exchange, double basePrice) {
+    /**
+     * @param industry 所属行业，用于把演示股票聚合为板块榜单。
+     *                 演示池里同一行业放 2 只是刻意的——单只股票的板块
+ *                 涨跌等于它自己的涨跌，看不出「聚合」与「个股」的区别，
+     *                 也就无法验证前端是否正确处理了多成分股的板块
+     */
+    private record StockSeed(String name, Exchange exchange, double basePrice, String industry) {
     }
 
     private record IndexSeed(String name, double baseValue) {

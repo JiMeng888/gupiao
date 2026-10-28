@@ -1,6 +1,15 @@
-import { api, clearTokens, getRefreshToken, saveTokens } from './http'
+import {
+  api,
+  clearTokens,
+  getRefreshToken,
+  saveTokens,
+  TIMEOUT,
+  type RequestOptions,
+} from './http'
 import type {
   AnalysisReport,
+  AnalysisTaskSubmission,
+  AnalysisTaskView,
   Bar,
   CarouselItem,
   DupontAnalysis,
@@ -14,6 +23,7 @@ import type {
   NewsChannelView,
   NewsItem,
   Quote,
+  Sector,
   StatementsResponse,
   StockBrief,
   TokenPair,
@@ -114,15 +124,31 @@ export const quoteApi = {
 
   source: () => api.get<MarketSourceStatus>('/quote/source'),
 
-  quote: (code: string) => api.get<Quote>(`/quote/${encodeURIComponent(code)}`),
+  /**
+   * 板块榜单。
+   *
+   * 上游不可用时后端返回 503，这里会抛 BizError，
+   * 调用方必须自己处理空态——不能 catch 掉当空列表，
+   * 「暂不可用」和「没有板块数据」在界面上是两回事。
+   */
+  sectors: (limit = 10, options?: RequestOptions) =>
+    api.get<Sector[]>('/quote/sectors', { limit }, options),
 
-  bars: (code: string, query: BarsQuery = {}) =>
-    api.get<Bar[]>(`/quote/${encodeURIComponent(code)}/bars`, {
-      period: query.period ?? 'daily',
-      limit: query.limit ?? 120,
-      start: query.start ?? '',
-      end: query.end ?? '',
-    }),
+  quote: (code: string, options?: RequestOptions) =>
+    api.get<Quote>(`/quote/${encodeURIComponent(code)}`, undefined, options),
+
+  /** `signal` 用于周期切换时取消上一个在途请求，见 StockChart.vue。 */
+  bars: (code: string, query: BarsQuery = {}, options?: RequestOptions) =>
+    api.get<Bar[]>(
+      `/quote/${encodeURIComponent(code)}/bars`,
+      {
+        period: query.period ?? 'daily',
+        limit: query.limit ?? 120,
+        start: query.start ?? '',
+        end: query.end ?? '',
+      },
+      options,
+    ),
 }
 
 // ---------------------------------------------------------------------------
@@ -216,15 +242,50 @@ export const holdingApi = {
 
 export const analysisApi = {
   /**
-   * 获取分析结论。
+   * 读取分析结论。
    *
-   * `GET` 优先返回数据库里的历史存档（省一次大模型调用，也省用户等待），
-   * `POST` 强制重新生成。UI 上应该把这两件事区分成两个按钮，
-   * 而不是一个「分析」按钮每次都在烧钱。
+   * `GET` 优先返回数据库里的历史存档（省一次大模型调用，也省用户等待）。
+   *
+   * <b>注意这不是一个「纯读」接口</b>：库里没有存档时后端会同步生成一次，
+   * 也就是会等大模型 10~40 秒。所以这里的超时预算取 TIMEOUT.analysis（75s），
+   * 不能吃全局的 20s——那样在没有存档的标的上必然超时，
+   * 而后端其实还在跑、稍后仍会把报告写进库，用户只会看到「获取分析失败」。
+   *
+   * 想避免这种等待，请用 {@link submit} + {@link pollAnalysisTask} 走异步链路。
    */
-  get: (code: string) => api.get<AnalysisReport>(`/analysis/${encodeURIComponent(code)}`),
+  get: (code: string, timeout: number = TIMEOUT.analysis) =>
+    api.get<AnalysisReport>(`/analysis/${encodeURIComponent(code)}`, undefined, { timeout }),
 
-  regenerate: (code: string) => api.post<AnalysisReport>(`/analysis/${encodeURIComponent(code)}`),
+  /**
+   * 强制重新生成（<b>同步</b>，会真实占用一个请求线程等大模型跑完）。
+   *
+   * 保留它是为了兼容与调试；界面上的「重新生成」应当用 {@link submit}，
+   * 否则后端的异步线程池等于白建。
+   */
+  regenerate: (code: string, timeout: number = TIMEOUT.analysis) =>
+    api.post<AnalysisReport>(`/analysis/${encodeURIComponent(code)}`, undefined, { timeout }),
+
+  /**
+   * 提交异步生成任务，立即返回 taskId（HTTP 202）。
+   *
+   * 代码非法时后端仍会同步返回 404，所以这个调用本身很快，
+   * 用默认超时即可——真正的等待发生在轮询阶段。
+   */
+  submit: (code: string) =>
+    api.post<AnalysisTaskSubmission>(
+      `/analysis/${encodeURIComponent(code)}/async`,
+      undefined,
+      { timeout: TIMEOUT.default },
+    ),
+
+  /**
+   * 查询异步任务状态。纯读库、不触发模型调用，用默认超时。
+   *
+   * taskId 失效（本地残留的过期 ID）时后端返回 404，
+   * 调用方需要据此停止轮询而不是一直重试。
+   */
+  task: (taskId: string) =>
+    api.get<AnalysisTaskView>(`/analysis/tasks/${encodeURIComponent(taskId)}`),
 
   history: (code: string, limit = 10) =>
     api.get<AnalysisReport[]>(`/analysis/${encodeURIComponent(code)}/history`, { limit }),

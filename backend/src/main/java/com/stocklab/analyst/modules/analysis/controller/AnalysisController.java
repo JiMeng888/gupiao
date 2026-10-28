@@ -5,6 +5,8 @@ import com.stocklab.analyst.common.ratelimit.RateLimit;
 import com.stocklab.analyst.common.ratelimit.RateLimitScope;
 import com.stocklab.analyst.modules.analysis.dto.AnalysisReport;
 import com.stocklab.analyst.modules.analysis.dto.AnalysisRequest;
+import com.stocklab.analyst.modules.analysis.dto.AnalysisTaskSubmission;
+import com.stocklab.analyst.modules.analysis.dto.AnalysisTaskView;
 import com.stocklab.analyst.modules.analysis.service.AnalysisService;
 import com.stocklab.analyst.security.CurrentUserId;
 import io.swagger.v3.oas.annotations.Operation;
@@ -13,6 +15,8 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -63,9 +67,12 @@ public class AnalysisController {
     @GetMapping("/{code}")
     @RateLimit(RateLimitScope.STRICT)
     @Operation(summary = "获取分析报告",
-            description = "优先返回历史存档（fromArchive=true），无存档时生成一次并归档。"
-                    + "未配置大模型 API Key 时返回规则化报告（model=rule-based）。"
-                    + "model 与 notice 字段必须在前端展示。")
+            description = "优先返回时效内的历史存档（fromArchive=true），"
+                    + "无存档或存档已超过 app.analysis.archive-max-age 时生成一次并归档。"
+                    + "未配置大模型 API Key 时返回规则化报告（model=rule-based），且规则化报告不入存档。"
+                    + "model 与 notice 字段必须在前端展示。"
+                    + "注意本接口在无存档时会同步等待大模型（最长 45 秒），"
+                    + "前端超时预算必须大于该值；想避免等待请用 POST /{code}/async。")
     public ApiResult<AnalysisReport> get(
             @Parameter(description = "股票代码", example = "600519")
             @PathVariable String code,
@@ -110,5 +117,51 @@ public class AnalysisController {
             @Max(value = 50, message = "最多返回 50 条")
             int limit) {
         return ApiResult.ok(analysisService.history(code, limit));
+    }
+
+    // ==================================================================
+    // 异步端点
+    // ==================================================================
+
+    /**
+     * 提交异步分析任务。
+     *
+     * <p>相对同步的 {@code POST /{code}}，这个端点<b>立即返回</b> taskId（202），
+     * 真正的大模型调用在后台线程执行，不占用 Tomcat 工作线程。前端拿到 taskId
+     * 后轮询 {@code GET /tasks/{taskId}} 直到 {@code status} 变为终态。
+     *
+     * <p>这是消除「约 5 个并发分析请求吃掉大半 Tomcat 线程池」的关键入口。
+     * 代码非法时仍会同步返回 404（入参校验不异步化）。
+     */
+    @PostMapping("/{code}/async")
+    @RateLimit(RateLimitScope.STRICT)
+    @Operation(summary = "提交异步分析任务",
+            description = "校验代码后立即返回 taskId（HTTP 202），大模型调用在后台执行。"
+                    + "前端轮询 GET /api/v1/analysis/tasks/{taskId} 获取结果。")
+    public ResponseEntity<ApiResult<AnalysisTaskSubmission>> submitAsync(
+            @Parameter(description = "股票代码", example = "600519")
+            @PathVariable String code,
+
+            @CurrentUserId(required = false) String userId) {
+        AnalysisTaskSubmission submission = analysisService.submit(code, userId);
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(ApiResult.ok(submission));
+    }
+
+    /**
+     * 查询异步任务状态与结果。
+     *
+     * <p>纯读库、不触发模型调用，用宽松桶。任务不存在返回 404，
+     * 前端据此清理本地残留的过期 taskId。
+     */
+    @GetMapping("/tasks/{taskId}")
+    @RateLimit(RateLimitScope.LOOSE)
+    @Operation(summary = "查询异步分析任务",
+            description = "返回任务状态（PENDING/RUNNING/SUCCESS/FAILED）。"
+                    + "SUCCESS 时 report 非空；FAILED 时 error 说明原因。")
+    public ApiResult<AnalysisTaskView> task(
+            @Parameter(description = "任务 ID")
+            @PathVariable String taskId,
+            @CurrentUserId(required = false) String userId) {
+        return ApiResult.ok(analysisService.task(taskId, userId));
     }
 }

@@ -14,6 +14,7 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 /**
  * 东方财富公开行情接口实现（真实数据，无需 API Key）。
@@ -64,8 +66,13 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
     private static final String HOST_PUSH2HIS = "https://push2his.eastmoney.com";
 
     /** 实时报价字段：43 现价 / 44 最高 / 45 最低 / 46 今开 / 47 成交量(手) / 48 成交额 /
-     *  57 代码 / 58 名称 / 60 昨收 / 168 换手率 / 169 涨跌额 / 170 涨跌幅 */
-    private static final String QUOTE_FIELDS = "f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170";
+     *  57 代码 / 58 名称 / 60 昨收 / 116 总市值 / 117 流通市值 / 168 换手率 /
+     *  169 涨跌额 / 170 涨跌幅。
+     *
+     *  <p>116 / 117 的单位是「元」。取不到时（停牌、部分指数标的）上游返回 {@code "-"}，
+     *  由 {@code readNullableDouble} 转成 null，前端渲染 {@code --}，不做推断填充。 */
+    private static final String QUOTE_FIELDS =
+            "f43,f44,f45,f46,f47,f48,f57,f58,f60,f116,f117,f168,f169,f170";
 
     /** K 线字段：51 日期 / 52 开 / 53 收 / 54 高 / 55 低 / 56 成交量 / 57 成交额 / 58 振幅 */
     private static final String KLINE_FIELDS_2 = "f51,f52,f53,f54,f55,f56,f57,f58";
@@ -115,6 +122,42 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
 
     /** 榜单字段：2 现价 / 3 涨跌幅 / 4 涨跌额 / 6 成交额 / 12 代码 / 14 名称。 */
     private static final String MOVER_FIELDS = "f2,f3,f4,f6,f12,f14";
+
+    /**
+     * 板块榜单筛选表达式：{@code m:90} 板块市场 + {@code t:2} 行业板块。
+     *
+     * <p>末尾的 {@code f:!50} 表示排除「昨日涨停」这类临时性板块，
+     * 它们每天变动、对观察行业轮动没有参考价值。
+     */
+    private static final String SECTOR_FILTER = "m:90+t:2+f:!50";
+
+    /** 板块字段：12 代码 / 14 名称 / 3 涨跌幅 / 104 上涨家数 / 105 下跌家数 /
+     *  128 领涨股名称 / 136 领涨股涨跌幅 / 140 领涨股代码。 */
+    private static final String SECTOR_FIELDS = "f12,f14,f3,f104,f105,f128,f136,f140";
+
+    /**
+     * {@code clist/get} 请求的最大尝试次数（板块榜与个股榜单共用）。
+     *
+     * <p><b>不是「更稳一点」，而是实测必需</b>：该接口会单次返回空响应
+     * （偶发，同一请求立刻重发即可成功），紧接着又恢复正常。
+     * 次数固定、退避递增，不做无限重试。
+     *
+     * <p>两个操作的代价不同，但都值得重试：
+     * <ul>
+     *   <li>板块榜缓存 60 秒，一次空响应会让整块面板白白不可用一分钟；</li>
+     *   <li>个股榜单缓存只有 3 秒（{@code quote-ttl}），但首页「今日涨幅榜」
+     *       <b>只在挂载时取一次、不轮询</b>——一次抖动会让那块面板一直空到
+     *       用户手动重试或刷新整页。所以问题不在缓存时长，而在「没人会自动再取一次」。</li>
+     * </ul>
+     *
+     * <p>个股榜单原本<em>没有</em>重试，理由是「调用方本来就有多个榜可看」。
+     * 2026-10-21 复核后改掉了这个判断：首页那个榜单并不会有「别的榜可看」，
+     * 同一时刻东财被风控也让它没有可降级的源（那时还没有新浪实现）。
+     */
+    private static final int CLIST_ATTEMPTS = 2;
+
+    /** {@code clist/get} 重试的退避基数（毫秒），第 n 次失败后等待 n 倍。 */
+    private static final long CLIST_RETRY_BACKOFF_MS = 120L;
 
     /** 榜单条数上限：前端三个榜单各展示 10 条左右，20 已经留足余量。 */
     private static final int MAX_MOVERS_LIMIT = 20;
@@ -184,7 +227,12 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
                 (long) readDouble(data, "f47", 0),
                 readDouble(data, "f168", 0),
                 readNullableDouble(data, "f48"),
-                System.currentTimeMillis() / 1000);
+                System.currentTimeMillis() / 1000,
+                readNullableDouble(data, "f116"),
+                // 延迟时长不由各数据源各自声明，统一由容灾链路盖章——
+                // 见 ResilientMarketDataProvider#getQuote 的说明。
+                // 这里固定传 0 表示「本源无自带延迟」，最终值以链路声明为准
+                0);
     }
 
     // ==================================================================
@@ -408,7 +456,9 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
      */
     @Override
     @Cacheable(cacheNames = CacheNames.QUOTE,
-            key = "'movers:' + #metric.name() + ':' + #ascending + ':' + #limit",
+            // 键里带源前缀：新浪的同名实现也用这组缓存，两家条数与口径都不同，
+            // 共用裸键会让「东财恢复后命中新浪的列表」。板块榜踩过这个坑
+            key = "'eastmoney:movers:' + #metric.name() + ':' + #ascending + ':' + #limit",
             sync = true)
     public List<Mover> getTopMovers(MoverMetric metric, boolean ascending, int limit) {
         int effectiveLimit = Math.min(Math.max(limit, 1), MAX_MOVERS_LIMIT);
@@ -420,15 +470,10 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
                 + "&fs=" + A_SHARE_FILTER
                 + "&fields=" + MOVER_FIELDS;
 
-        JsonNode root = fetchJson(url, "市场榜单", metric.name());
-        List<Mover> result = parseMoversResponse(root, metric.eastmoneyFid());
-        if (result.isEmpty()) {
-            // data:null（rc:102）或空列表都算「上游没给出榜单」，
-            // 抛不可用交给路由器决定是否降级，而不是返回空集合假装正常
-            throw new MarketDataUnavailableException(
-                    "榜单上游返回空数据（fid=" + metric.eastmoneyFid() + "）");
-        }
-        return Collections.unmodifiableList(result);
+        // 空数组（data:null / rc:102）会由解析器返回空列表，重试逻辑统一在
+        // fetchClistWithRetry 里——理由见 CLIST_ATTEMPTS 的说明
+        return fetchClistWithRetry(url, "市场榜单", metric.name(),
+                root -> parseMoversResponse(root, metric.eastmoneyFid()));
     }
 
     /**
@@ -459,6 +504,79 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
                     readDouble(item, "f4", 0),
                     readDouble(item, "f3", 0),
                     readDouble(item, "f6", 0)));
+        }
+        return result;
+    }
+
+    // ==================================================================
+    // 板块榜单
+    // ==================================================================
+
+    /**
+     * 板块榜单：按涨跌幅排序的行业板块前列条目。
+     *
+     * <p><b>「策略性拒绝编造榜单」这条约定同样适用于板块</b>，理由比个股榜单更强：
+     * 板块是<b>聚合</b>结果，名次本身携带「这个方向现在有机会」的判断。
+     * 演示池只有 10 只固定股票，由它推出的板块排序与真实市场无关，
+     * 却比一串乱码更像结论——而用户恰恰是按板块找方向的。
+     * 因此上游拿不到时抛不可用，让路由决定降级，绝不返回编造的排序。
+     *
+     * <p>接口走与个股榜单同款的 {@code clist/get}，差别只在 {@code fs}：
+     * {@code m:90} 表示板块市场，{@code t:2} 表示行业板块
+     * （{@code t:3} 为概念板块、{@code t:1} 为地域板块）。
+     * 实测（2026-10-19）该形态在无 Cookie 的服务端请求下可正常返回。
+     *
+     * <p><b>为什么本操作需要重试</b>：{@code clist/get} 会单次返回空响应
+     * （服务端主动断连或 {@code rc:102}），同一请求立刻重发就成功。
+     * 板块榜缓存 60 秒，一次抖动会放大成「整块面板一分钟不可用」，
+     * 因此走 {@link #fetchClistWithRetry}；个股榜单现在也走同一条路径。
+     */
+    @Override
+    @Cacheable(cacheNames = CacheNames.SECTORS, key = "'eastmoney:' + #limit", sync = true)
+    public List<Sector> getSectors(int limit) {
+        int effectiveLimit = Math.min(Math.max(limit, 1), MAX_MOVERS_LIMIT);
+        String url = HOST_PUSH2 + "/api/qt/clist/get"
+                + "?pn=1&pz=" + effectiveLimit
+                + "&po=1&np=1&fltt=2&invt=2"   // po=1：按 fid 降序，即涨幅榜
+                + "&fid=f3"
+                + "&fs=" + SECTOR_FILTER
+                + "&fields=" + SECTOR_FIELDS;
+
+        return fetchClistWithRetry(url, "板块榜单", "sectors",
+                EastMoneyMarketDataProvider::parseSectorsResponse);
+    }
+
+    /**
+     * 解析板块榜单响应。
+     *
+     * <p>包级可见，便于用真实响应样本做单元测试。
+     * {@code data} 为 {@code null}（上游拒绝时的 {@code rc:102} 形态）
+     * 或 {@code diff} 为空数组时返回空列表。
+     */
+    static List<Sector> parseSectorsResponse(JsonNode root) {
+        JsonNode diff = root == null ? null : root.path("data").path("diff");
+        if (diff == null || !diff.isArray() || diff.isEmpty()) {
+            return List.of();
+        }
+        List<Sector> result = new ArrayList<>(diff.size());
+        for (JsonNode item : diff) {
+            String code = text(item, "f12", "");
+            String name = text(item, "f14", "");
+            if (code.isBlank() || name.isBlank()) {
+                continue;
+            }
+            result.add(new Sector(
+                    code,
+                    name,
+                    readDouble(item, "f3", 0),
+                    readNullableInt(item, "f104"),
+                    readNullableInt(item, "f105"),
+                    nullIfBlank(text(item, "f128", "")),
+                    // 只认 6 位 A 股代码：上游偶尔给 "-" 或空串，交 null 比交半截字符串安全
+                    StockCodes.isSixDigitCode(text(item, "f140", ""))
+                            ? text(item, "f140", "")
+                            : null,
+                    readNullableDouble(item, "f136")));
         }
         return result;
     }
@@ -618,6 +736,49 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
         }
     }
 
+    /**
+     * 发起 {@code clist/get} 请求并按有界重试解析。
+     *
+     * <p>抽成一个方法而不是在两个操作里各写一遍循环，是因为「空结果要不要重试」
+     * 这条判断本身就容易写歪：把「上游返回空数组」当成正常结果返回，
+     * 上层会显示成一个空榜单（「今天没有上涨的股票」），而不是一次故障。
+     * 这里统一把<b>空结果</b>与<b>请求异常</b>都当作「本次没拿到」，
+     * 重试用尽后抛 {@link MarketDataUnavailableException}，让路由去降级。
+     *
+     * @param parser 把响应树解析成列表；返回空列表表示上游没给出数据
+     */
+    private <T> List<T> fetchClistWithRetry(String url,
+                                            String action,
+                                            String subject,
+                                            Function<JsonNode, List<T>> parser) {
+        MarketDataUnavailableException lastFailure = null;
+        for (int attempt = 1; attempt <= CLIST_ATTEMPTS; attempt++) {
+            try {
+                List<T> parsed = parser.apply(fetchJson(url, action, subject));
+                if (!parsed.isEmpty()) {
+                    return Collections.unmodifiableList(parsed);
+                }
+                // 空数组与 data:null 都算「这次没拿到」，值得再试一次：
+                // 上游对同一请求的相邻两次调用给出不同结果，是已实测到的行为
+                lastFailure = new MarketDataUnavailableException(
+                        action + "上游返回空数据（" + subject + "，第 " + attempt + " 次尝试）");
+            } catch (MarketDataUnavailableException ex) {
+                lastFailure = ex;
+            }
+            if (attempt < CLIST_ATTEMPTS) {
+                try {
+                    Thread.sleep(CLIST_RETRY_BACKOFF_MS * attempt);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        throw lastFailure != null
+                ? lastFailure
+                : new MarketDataUnavailableException(action + "上游返回空数据（" + subject + "）");
+    }
+
     private StockCodes.ParsedCode requireParsed(String code) {
         StockCodes.ParsedCode parsed = StockCodes.parse(code);
         if (parsed == null) {
@@ -659,6 +820,48 @@ public class EastMoneyMarketDataProvider implements MarketDataProvider {
     private static String text(JsonNode node, String field, String fallback) {
         JsonNode value = node.path(field);
         return value.isString() && !value.asString().isBlank() ? value.asString() : fallback;
+    }
+
+    /**
+     * 读取可空整数字段（上涨 / 下跌家数）。
+     *
+     * <p>与 {@link #readNullableDouble(JsonNode, String)} 的区别是它额外接受
+     * 「数字形式的字符串」——上游的家数字段偶发以字符串返回，
+     * 而这一项<b>不能用 0 兜底</b>：0 家上涨与「上游没给」是两件事，
+     * 前者会让前端渲染出「0 / 12」这种看起来正常其实无意义的比例。
+     */
+    private static Integer readNullableInt(JsonNode node, String field) {
+        JsonNode value = node.path(field);
+        if (value.isNumber()) {
+            return value.asInt();
+        }
+        if (value.isString()) {
+            String raw = value.asString().trim();
+            if (raw.isEmpty() || "-".equals(raw)) {
+                return null;
+            }
+            try {
+                return Integer.valueOf(raw);
+            } catch (NumberFormatException ex) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 空白串 / 占位符 {@code "-"} 归一为 {@code null}。
+     *
+     * <p>用于「可以不给」的字段（如领涨股）。这里不能用空串兜底：
+     * 空串会被前端当成一个正常的空名字渲染出来，而 null 会走「--」占位，
+     * 语义上才是「上游没给」。
+     */
+    private static String nullIfBlank(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        return trimmed.isEmpty() || "-".equals(trimmed) ? null : trimmed;
     }
 
     private static double parseDouble(String raw, double fallback) {

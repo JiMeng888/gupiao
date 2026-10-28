@@ -40,7 +40,8 @@ public enum ErrorCode {
 
     // ---------- AI ----------
     LLM_UPSTREAM_ERROR("大模型调用失败", HttpStatus.BAD_GATEWAY),
-    LLM_TIMEOUT("大模型响应超时", HttpStatus.GATEWAY_TIMEOUT);
+    LLM_TIMEOUT("大模型响应超时", HttpStatus.GATEWAY_TIMEOUT),
+    ANALYSIS_TASK_NOT_FOUND("分析任务不存在", HttpStatus.NOT_FOUND);
 
     private final String defaultMessage;
     private final HttpStatus status;

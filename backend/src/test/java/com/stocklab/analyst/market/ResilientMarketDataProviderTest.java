@@ -9,6 +9,7 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -654,6 +655,83 @@ class ResilientMarketDataProviderTest {
 
     // ==================================================================
     /**
+     * 个股榜单的专用链（{@code eastmoney → sina → mock}）的专测。
+     *
+     * <p>与板块链的差别在于<b>为什么需要它</b>：板块链是为了口径，
+     * 榜单链是为了可用性——榜单只有东财与新浪两家真实能力，
+     * 而新浪在本项目里只实现榜单，所以它不在主链上。
+     * 这个结构有一个容易漏掉的失效方式：<b>实现了新浪却忘了登记专用链</b>，
+     * 此时它根本不会被调用，故障现场看起来与「没实现」一模一样。
+     * 下面的用例正是钉住这一点。
+     */
+    @Nested
+    @DisplayName("个股榜单的独立链")
+    class MoversActionChain {
+
+        private static final String ACTION_MOVERS = "getTopMovers";
+
+        private FakeProvider eastMoney;
+        private FakeProvider sina;
+        private FakeProvider mock;
+
+        @BeforeEach
+        void setUpMoversChain() {
+            eastMoney = new FakeProvider("eastmoney");
+            sina = new FakeProvider("sina");
+            mock = new FakeProvider("mock");
+        }
+
+        /** 主链只有 eastmoney → mock（新浪不进主链），榜单单独配 eastmoney → sina → mock。 */
+        private ResilientMarketDataProvider moversRouter() {
+            return new ResilientMarketDataProvider(
+                    List.of(eastMoney, mock), true, 0L, registry, 0,
+                    Map.of(ACTION_MOVERS, List.of(eastMoney, sina, mock)));
+        }
+
+        @Test
+        @DisplayName("东财榜单不可用时新浪接管，数据可用且不算演示降级")
+        void sinaTakesOverWhenEastmoneyFails() {
+            eastMoney.failOnly(ACTION_MOVERS, unavailable("东财 clist 被风控"));
+            ResilientMarketDataProvider router = moversRouter();
+
+            List<Mover> movers = router.getTopMovers(MoverMetric.CHANGE_PCT, false, 10);
+
+            assertThat(movers.get(0).name()).isEqualTo("sina-mover");
+            assertThat(router.servingByAction()).containsEntry(ACTION_MOVERS, "sina");
+            assertThat(router.degraded())
+                    .as("备用真实源接管不是降级——前端不该打「演示数据」标记")
+                    .isFalse();
+            assertThat(mock.callCount(ACTION_MOVERS)).isZero();
+        }
+
+        @Test
+        @DisplayName("两家真实榜单源都不可用时，mock 拒绝编造排序，文案里不能露出方法名")
+        void bothRealSourcesDownYieldsReadableUnavailable() {
+            eastMoney.failOnly(ACTION_MOVERS, unavailable("东财断连"));
+            sina.failOnly(ACTION_MOVERS, unavailable("新浪断连"));
+            mock.refuseAsFallback(ACTION_MOVERS);
+
+            assertThatThrownBy(() -> moversRouter().getTopMovers(MoverMetric.CHANGE_PCT, false, 10))
+                    .isInstanceOf(MarketDataUnavailableException.class)
+                    .hasMessageContaining("市场榜单暂不可用")
+                    .hasMessageNotContaining("getTopMovers");
+        }
+
+        @Test
+        @DisplayName("榜单链只作用于榜单：报价不走新浪")
+        void quoteDoesNotUseSina() {
+            eastMoney.failOnly(ACTION_QUOTE, unavailable("东财报价接口被风控"));
+            ResilientMarketDataProvider router = moversRouter();
+
+            assertThat(router.getQuote("600519").name())
+                    .as("新浪在本项目里只有榜单能力，报价必须落到链尾兜底源")
+                    .isEqualTo("mock-600519");
+            assertThat(sina.callCount(ACTION_QUOTE)).isZero();
+        }
+    }
+
+    // ==================================================================
+    /**
      * 多级降级链（{@code eastmoney → tencent → mock}）的专测。
      *
      * <p>主源被东财风控掐断后，备用真实源（腾讯）应当接管——
@@ -944,6 +1022,93 @@ class ResilientMarketDataProviderTest {
     }
 
     // ==================================================================
+    @Nested
+    @DisplayName("按操作的降级链")
+    class ActionScopedChain {
+
+        private static final String ACTION_SECTORS = "getSectors";
+
+        private FakeProvider eastMoney;
+        private FakeProvider tencent;
+        private FakeProvider mock;
+
+        @BeforeEach
+        void setUpActionChain() {
+            eastMoney = new FakeProvider("eastmoney");
+            tencent = new FakeProvider("tencent");
+            mock = new FakeProvider("mock");
+        }
+
+        /** 主链东财优先，板块榜单独配成腾讯优先。 */
+        private ResilientMarketDataProvider sectorFirstRouter() {
+            return new ResilientMarketDataProvider(
+                    List.of(eastMoney, tencent, mock), true, 0L, registry, 0,
+                    Map.of(ACTION_SECTORS, List.of(tencent, eastMoney, mock)));
+        }
+
+        @Test
+        @DisplayName("板块榜按自己的链走：主链头健康时仍由腾讯服务")
+        void sectorChainIsHonoured() {
+            ResilientMarketDataProvider router = sectorFirstRouter();
+
+            assertThat(router.getSectors(10).get(0).code())
+                    .as("板块榜应走腾讯的一级行业口径，而不是主链第一位的东财")
+                    .isEqualTo("tencent-sector");
+            assertThat(router.servingByAction()).containsEntry(ACTION_SECTORS, "tencent");
+        }
+
+        @Test
+        @DisplayName("覆盖链只作用于该操作：报价仍走主链头")
+        void otherActionsKeepMainChain() {
+            ResilientMarketDataProvider router = sectorFirstRouter();
+
+            router.getQuote("600519");
+            router.getSectors(10);
+
+            assertThat(router.servingByAction())
+                    .containsEntry(ACTION_QUOTE, "eastmoney")
+                    .containsEntry(ACTION_SECTORS, "tencent");
+            assertThat(eastMoney.callCount(ACTION_SECTORS)).isZero();
+        }
+
+        @Test
+        @DisplayName("覆盖链首级失败时降级到链中下一级，而不是回主链头")
+        void sectorChainFallsThroughInOrder() {
+            ResilientMarketDataProvider router = sectorFirstRouter();
+            tencent.failOnly(ACTION_SECTORS, unavailable("腾讯板块接口不可用"));
+
+            assertThat(router.getSectors(10).get(0).code()).isEqualTo("eastmoney-sector");
+            assertThat(router.servingByAction()).containsEntry(ACTION_SECTORS, "eastmoney");
+            assertThat(fallbackMetricFrom(ACTION_SECTORS, "tencent")).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("板块 503 的文案里必须是「板块榜单」，不能露出方法名")
+        void sectorUnavailableMessageIsHumanReadable() {
+            ResilientMarketDataProvider router = sectorFirstRouter();
+            eastMoney.failOnly(ACTION_SECTORS, unavailable("东财断连"));
+            tencent.failOnly(ACTION_SECTORS, unavailable("腾讯断连"));
+            mock.refuseAsFallback(ACTION_SECTORS);
+
+            assertThatThrownBy(() -> router.getSectors(10))
+                    .isInstanceOf(MarketDataUnavailableException.class)
+                    .hasMessageContaining("板块榜单暂不可用")
+                    .hasMessageNotContaining("getSectors");
+        }
+
+        @Test
+        @DisplayName("覆盖链末位不是兜底源时构造失败")
+        void rejectsOverrideChainWithoutFallback() {
+            assertThatThrownBy(() -> new ResilientMarketDataProvider(
+                    List.of(eastMoney, tencent, mock), true, 0L, registry, 0,
+                    Map.of(ACTION_SECTORS, List.of(tencent, eastMoney))))
+                    .as("末位不是兜底源，degraded() 会漏判「板块正在用演示数据」")
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("兜底源");
+        }
+    }
+
+    // ==================================================================
     // 辅助
 
     private static MarketDataUnavailableException unavailable(String message) {
@@ -1083,6 +1248,14 @@ class ResilientMarketDataProviderTest {
             // 价格带数据源名前缀，让「这条榜单来自谁」可以直接断言
             return List.of(new Mover("600519", name + "-mover",
                     1700.0, 12.0, 0.71, 1.2e8));
+        }
+
+        @Override
+        public List<Sector> getSectors(int limit) {
+            record("getSectors");
+            maybeFail("getSectors");
+            return List.of(new Sector(name + "-sector", name + "-板块", 1.5,
+                    3, 2, name + "-leader", "600519", 5.0));
         }
 
         @Override

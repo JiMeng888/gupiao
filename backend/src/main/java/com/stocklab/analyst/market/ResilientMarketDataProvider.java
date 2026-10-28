@@ -6,6 +6,7 @@ import com.stocklab.analyst.market.model.MarketPeriod;
 import com.stocklab.analyst.market.model.Mover;
 import com.stocklab.analyst.market.model.MoverMetric;
 import com.stocklab.analyst.market.model.Quote;
+import com.stocklab.analyst.market.model.Sector;
 import com.stocklab.analyst.market.model.StockBrief;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -104,9 +105,29 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
     /** 数据源降级链，下标 0 是主数据源，末位是兜底源。 */
     private final List<MarketDataProvider> chain;
 
+    /**
+     * 按操作覆盖的降级链（键为操作名，如 {@code getSectors}）。
+     *
+     * <p><b>为什么需要它</b>：各数据源的能力不是同一套，同一个顺序不可能对所有
+     * 操作都最优。典型例子是板块榜——东财的行业板块接口把一级/二级/三级混在
+     * 496 个板块里且没有层级字段，按涨幅排序会被「只有两三只成分股」的微板块
+     * 占据头部；腾讯给的 31 个一级行业口径统一，更适合做榜单。
+     * 而报价、K 线、搜索仍应是东财优先。
+     *
+     * <p>若不提供覆盖链，就只能二选一：要么全局改顺序（让报价/K线也换主源），
+     * 要么接受某个操作长期用次优口径。两条都不好。
+     *
+     * <p>约束（构造时校验）：覆盖链末位必须与主链末位同名，否则
+     * {@link #degraded()} 会漏判「某某操作正在用演示数据」。
+     */
+    private final Map<String, List<MarketDataProvider>> actionChains;
+
     private final boolean fallbackEnabled;
     private final long cooldownMillis;
     private final MeterRegistry meterRegistry;
+
+    /** 对外声明的行情延迟分钟数；0 = 实时。见对应构造器的说明。 */
+    private final int quoteDelayMinutes;
 
     /**
      * 各操作最近一次实际服务源。只记录「最近一次」：主数据源恢复后，
@@ -141,6 +162,42 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
                                        boolean fallbackEnabled,
                                        long cooldownMillis,
                                        MeterRegistry meterRegistry) {
+        this(chain, fallbackEnabled, cooldownMillis, meterRegistry, 0);
+    }
+
+    /**
+     * 带行情延迟声明的构造。
+     *
+     * @param quoteDelayMinutes 该数据源链路对外声明的行情延迟分钟数，0 表示实时
+     *
+     * <p><b>为什么延迟声明要由数据源链路统一盖章，而不是让前端自己判断</b>：
+     * 「是否延迟」是数据供给方的属性，前端无从得知；而合规要求是
+     * <b>使用非实时行情时必须在价格附近明示延迟时长</b>——真接了延迟源却没标注，
+     * 是这个领域最典型的合规事故。把声明放在链路上，REST 与 WebSocket
+     * 两条出口都会带上，不会漏。
+     */
+    public ResilientMarketDataProvider(List<MarketDataProvider> chain,
+                                       boolean fallbackEnabled,
+                                       long cooldownMillis,
+                                       MeterRegistry meterRegistry,
+                                       int quoteDelayMinutes) {
+        this(chain, fallbackEnabled, cooldownMillis, meterRegistry, quoteDelayMinutes, Map.of());
+    }
+
+    /**
+     * 带「按操作覆盖降级链」的构造。
+     *
+     * @param actionChains 操作名 → 该操作的降级链；未列出的操作使用主链。
+     *                     每条覆盖链的末位必须与主链末位同名（都是兜底源），
+     *                     否则 {@link #degraded()} 无法判断该操作是否在用演示数据
+     * @throws IllegalArgumentException 覆盖链为空，或末位与主链末位不同名
+     */
+    public ResilientMarketDataProvider(List<MarketDataProvider> chain,
+                                       boolean fallbackEnabled,
+                                       long cooldownMillis,
+                                       MeterRegistry meterRegistry,
+                                       int quoteDelayMinutes,
+                                       Map<String, List<MarketDataProvider>> actionChains) {
         if (chain == null || chain.isEmpty()) {
             throw new IllegalArgumentException("行情数据源链不能为空");
         }
@@ -148,6 +205,26 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
         this.fallbackEnabled = fallbackEnabled;
         this.cooldownMillis = Math.max(0, cooldownMillis);
         this.meterRegistry = meterRegistry;
+        this.quoteDelayMinutes = Math.max(0, quoteDelayMinutes);
+
+        String tailName = this.chain.get(this.chain.size() - 1).name();
+        Map<String, List<MarketDataProvider>> overrides = new java.util.HashMap<>();
+        if (actionChains != null) {
+            for (Map.Entry<String, List<MarketDataProvider>> entry : actionChains.entrySet()) {
+                List<MarketDataProvider> actionChain = entry.getValue();
+                if (actionChain == null || actionChain.isEmpty()) {
+                    throw new IllegalArgumentException(
+                            "操作 " + entry.getKey() + " 的降级链不能为空");
+                }
+                String actionTail = actionChain.get(actionChain.size() - 1).name();
+                if (!tailName.equals(actionTail)) {
+                    throw new IllegalArgumentException("操作 " + entry.getKey()
+                            + " 的降级链末位必须是兜底源 " + tailName + "，实际是 " + actionTail);
+                }
+                overrides.put(entry.getKey(), List.copyOf(actionChain));
+            }
+        }
+        this.actionChains = Map.copyOf(overrides);
     }
 
     @Override
@@ -178,7 +255,9 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
 
     @Override
     public Quote getQuote(String code) {
-        return route("getQuote", code, provider -> provider.getQuote(code));
+        // 延迟声明在这里盖章：REST、WebSocket、轮播三条出口都走这个方法，
+        // 只要有一处漏标就是合规问题，因此不能下放到各自的调用方去补。
+        return route("getQuote", code, provider -> provider.getQuote(code).withDelayMinutes(quoteDelayMinutes));
     }
 
     @Override
@@ -200,6 +279,18 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
     public List<Mover> getTopMovers(MoverMetric metric, boolean ascending, int limit) {
         return route("getTopMovers", metric.name(),
                 provider -> provider.getTopMovers(metric, ascending, limit));
+    }
+
+    /**
+     * 板块榜单。
+     *
+     * <p>本操作可能有<b>自己的优先链</b>（{@link #actionChains}）：
+     * 板块榜默认优先腾讯的一级行业口径，而不是主链第一位的东财。
+     * 原因见 {@code TencentMarketDataProvider#getSectors} 的说明。
+     */
+    @Override
+    public List<Sector> getSectors(int limit) {
+        return route("getSectors", "-", provider -> provider.getSectors(limit));
     }
 
     @Override
@@ -230,15 +321,17 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
      * （前者是用户的输入问题，后者是我们自己的 bug，两者都不该被降级掩盖）。
      */
     private <T> T route(String action, String subject, Function<MarketDataProvider, T> call) {
-        String primaryName = chain.get(0).name();
+        // 该操作实际使用的链：默认主链，少数操作（如板块榜）有自己的优先顺序
+        List<MarketDataProvider> effective = chainFor(action);
+        String primaryName = effective.get(0).name();
         // 关闭降级 = 只允许链头第一级服务；链上只有一级时同样没有「下一级」
-        int usableCount = fallbackEnabled && chain.size() > 1 ? chain.size() : 1;
+        int usableCount = fallbackEnabled && effective.size() > 1 ? effective.size() : 1;
         MarketDataUnavailableException lastUnavailable = null;
         // 是否有降级源「策略性拒绝」为该操作提供演示数据（见 acceptableAsFallback）
         boolean refusedFabrication = false;
 
         for (int i = 0; i < usableCount; i++) {
-            MarketDataProvider provider = chain.get(i);
+            MarketDataProvider provider = effective.get(i);
             boolean hasFallbackAfter = i < usableCount - 1;
             String cooldownKey = action + ":" + provider.name();
 
@@ -286,7 +379,7 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
                     // 否则「降级兜住了」和「一个请求都没兜住」在指标上无法区分。
                     meterRegistry.counter("app.market_data.unavailable",
                             "action", action, "primary", primaryName).increment();
-                    String reason = fallbackEnabled && chain.size() > 1
+                    String reason = fallbackEnabled && effective.size() > 1
                             ? "整条降级链均不可用"
                             : "已关闭演示数据降级";
                     log.warn("行情主数据源不可用，且{}（action={} subject={}）：{}",
@@ -323,6 +416,9 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
      * <p>单独抽出来的原因是：{@link MarketDataUnavailableException} 的 message
      * 会随 503 返回给前端并可能直接显示给用户，
      * 让用户看到「getTopMovers 暂不可用」是没有意义的。
+     *
+     * <p>新增操作时必须同步这里：漏一个 case 不会报错，只会在故障时
+     * 把一个内部方法名原样贴到用户界面上（板块榜曾漏过，见下方 default 分支）。
      */
     private static String actionLabel(String action) {
         return switch (action) {
@@ -331,8 +427,15 @@ public class ResilientMarketDataProvider implements MarketDataProvider {
             case "getIndices" -> "大盘指数";
             case "search" -> "股票搜索";
             case "getTopMovers" -> "市场榜单";
+            case "getSectors" -> "板块榜单";
             default -> action;
         };
+    }
+
+    /** 取该操作实际使用的链；没有专门配置时用主链。 */
+    private List<MarketDataProvider> chainFor(String action) {
+        List<MarketDataProvider> override = actionChains.get(action);
+        return override != null ? override : chain;
     }
 
     private void markServed(String action, MarketDataProvider provider) {

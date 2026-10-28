@@ -8,17 +8,44 @@
  */
 
 :root {
+  /* 告诉浏览器「这个文档是亮色的」：原生滚动条、输入框自动填充、
+    日期选择器等由 UA 绘制的部件才会跟着变。深色下在下方改为 dark。 */
+  color-scheme: light;
+
   /* 涨：红；跌：绿。仅此一处定义，其余地方引用变量 */
   --color-up: #d92b2b;
   --color-down: #0a9e5c;
   --color-flat: #8c8c8c;
 
+  /*
+    涨跌色的极淡底色（看多/看空面板、涨跌对比块）。
+    必须单独定义：深色底上同样的 rgba 几乎看不见，
+    直接沿用亮色的透明度会得到两块「什么都没变」的空白。
+  */
+  --tint-up: rgba(217, 43, 43, 0.05);
+  --tint-down: rgba(10, 158, 92, 0.06);
+
   --color-bg: #f5f6f8;
   --color-surface: #ffffff;
+  /* 卡片内的次级底色（指标格、榜单悬停）。与 --color-surface 分层使用 */
+  --color-surface-muted: #fafbfc;
+  /* 弹层（下拉、对话框）用的最高一档海拔。亮色下与卡片同色，靠阴影区分 */
+  --color-surface-elevated: #ffffff;
+  /* 顶栏专用：半透明，配合 backdrop-filter 让滚动内容从底下透出 */
+  --color-surface-translucent: rgba(255, 255, 255, 0.86);
   --color-border: #e4e7ed;
+  /* 比 --color-border 更重一档，用于状态点、分隔线等需要被看见的描边 */
+  --color-border-strong: #c8cdd4;
   --color-text-primary: #1f2329;
   --color-text-regular: #4e5969;
   --color-text-secondary: #86909c;
+
+  /*
+    UI 状态色（警告）。刻意与涨跌色分开设：
+    免责声明、降级提示这类「界面状态」不该用红绿表达，
+    否则用户会把「橙色警告」误读成行情信号。
+  */
+  --color-warning: #b88230;
 
   --radius-sm: 4px;
   --radius-md: 8px;
@@ -29,6 +56,279 @@
 
   --layout-max-width: 1440px;
   --header-height: 60px;
+
+  /* 图表专用：ECharts 的 option 是纯 JS 对象，读不到 CSS 变量，
+     只能由 composable（见 composables/useChartTheme.ts）取出来再塞回去。
+     这里定义的是「与涨跌色同源」的图表色，
+     保证 K 线颜色与页面数字颜色永远一致。 */
+  --chart-up: #d92b2b;
+  --chart-down: #0a9e5c;
+  --chart-axis: #dcdfe6;
+  --chart-split: #f0f2f5;
+  --chart-text: #4e5969;
+  --chart-tooltip-bg: rgba(255, 255, 255, 0.96);
+  --chart-tooltip-border: #e4e7ed;
+  --chart-cross-label: #606266;
+  /* 图表 loading 遮罩。ECharts 不吃 CSS 变量，由 BaseChart 读出来再传给 showLoading */
+  --chart-loading-mask: rgba(255, 255, 255, 0.65);
+
+  /*
+    叠加线配色：均线 / MACD / RSI / 分时价格线。
+    刻意不使用涨跌红绿——这些线表达的是「趋势与均值的偏离」，
+    若与涨跌同色，用户会把它误读成当根 K 线的涨跌信号。
+  */
+  --chart-ma5: #e6a23c;
+  --chart-ma10: #409eff;
+  --chart-ma20: #9b59b6;
+  --chart-ma60: #909399;
+  --chart-dif: #e6a23c;
+  --chart-dea: #409eff;
+  --chart-rsi: #9b59b6;
+  --chart-price: #f0a020;
+}
+
+/**
+ * 暗色主题。
+ *
+ * <p><b>涨跌色在暗色下必须重新取，不能直接沿用亮色的值。</b>
+ * 亮色下的「红 #d92b2b」在深色背景上偏暗、辨识度显著下降，
+ * 而红色在中国市场代表「涨」，是这个页面最不能读错的信号——
+ * 因此暗色下提高红绿的亮度与饱和度，对比度按深底重新调。
+ *
+ * <p>切换方式：在 {@code <html>} 上设置 {@code data-theme="dark"}。
+ * 用 data 属性而不是 class，是为了让主题状态在 DevTools 里
+ * 一眼可辨，且不会被组件 scoped 样式意外覆盖。
+ */
+[data-theme='dark'] {
+  /*
+    深色不是把亮色「反过来」，而是重新排一套海拔。
+
+    亮色靠阴影拉开层次；深色下投影几乎不可见，只能靠「越靠前越亮」：
+    页面底 → 卡片 → 卡片内指标格 → 弹层/悬停。
+
+    之前只把 surface 设成 #1c1f24、bg 设成 #14161a，两者只差 8 个色阶，
+    卡片于是糊在背景里，整页像一块黑板——这不是「配色不好看」，
+    是没有建立层次。
+  */
+  color-scheme: dark;
+
+  /*
+    涨跌色在深底上重取：亮度要够，但**降低饱和度**。
+    原来的一对 #ff5c5c / #2fd48a 在深色下像霓虹灯，而浮动盈亏是大号数字，
+    大面积铺开非常刺眼。现在这对值对 #171a1f 的对比度分别是 5.0:1 与 6.9:1，
+    既过 AA 又不抢注意力。
+  */
+  --color-up: #ef5350;
+  --color-down: #26b880;
+  --color-flat: #8b93a1;
+
+  /* 深底上的淡底要比亮色更浓一档，否则等于没画 */
+  --tint-up: rgba(239, 83, 80, 0.1);
+  --tint-down: rgba(38, 184, 128, 0.1);
+
+  --color-bg: #0e1013;
+  --color-surface: #171a1f;
+  --color-surface-muted: #1e222a;
+  --color-surface-elevated: #262b33;
+  --color-surface-translucent: rgba(23, 26, 31, 0.86);
+
+  --color-border: #262b33;
+  --color-border-strong: #3a414c;
+  --color-text-primary: #e9ebef;
+  --color-text-regular: #b3b9c4;
+  --color-text-secondary: #7d8590;
+  --color-warning: #d9a441;
+
+  /* 深底上投影不可见，改用「一圈内高光」表达卡片被抬起 */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  --shadow-raised: 0 8px 24px rgba(0, 0, 0, 0.55);
+
+  --chart-up: #ef5350;
+  --chart-down: #26b880;
+  --chart-axis: #333a44;
+  --chart-split: #22272f;
+  --chart-text: #8b93a1;
+  --chart-tooltip-bg: rgba(30, 34, 42, 0.96);
+  --chart-tooltip-border: #333a44;
+  --chart-cross-label: #3a414c;
+  --chart-loading-mask: rgba(14, 16, 19, 0.65);
+
+  /* 叠加线在深底上同样提亮，否则橙/紫会糊在背景里 */
+  --chart-ma5: #f0b155;
+  --chart-ma10: #6cb6ff;
+  --chart-ma20: #b98ada;
+  --chart-ma60: #a8adb5;
+  --chart-dif: #f0b155;
+  --chart-dea: #6cb6ff;
+  --chart-rsi: #b98ada;
+  --chart-price: #ffb43d;
+
+  /* ================================================================
+     Element Plus 变量接管
+     ================================================================
+
+     项目按需引入 Element Plus，但没有引官方那份
+     element-plus/theme-chalk/dark/css-vars.css——它挂在 .dark 类上，
+     与本项目 data-theme 的约定是两套状态，混用迟早出现
+     「页面已经暗了、组件还是亮的」。
+
+     不接管这些变量的后果不是「颜色略淡」，而是**组件直接保持亮色**：
+     深色页面上顶着白色导航栏、白色搜索框、浅米色警告条。
+     一眼就能看出是两套东西拼起来的——这正是截图里最主要的问题。
+     ================================================================ */
+
+  /* --- 基础色板 --- */
+  --el-bg-color: var(--color-surface);
+  --el-bg-color-page: var(--color-bg);
+  --el-bg-color-overlay: var(--color-surface-elevated);
+
+  --el-text-color-primary: var(--color-text-primary);
+  --el-text-color-regular: var(--color-text-regular);
+  --el-text-color-secondary: var(--color-text-secondary);
+  --el-text-color-placeholder: #6b7280;
+  --el-text-color-disabled: #565d68;
+
+  --el-border-color: var(--color-border);
+  --el-border-color-light: #2b313a;
+  --el-border-color-lighter: #232830;
+  --el-border-color-extra-light: #1e232a;
+  --el-border-color-dark: var(--color-border-strong);
+  --el-border-color-darker: #4a525e;
+
+  /*
+    fill-* 是 hover、斑马纹、禁用底色的来源。
+    漏掉这一组最典型的症状是：表格行本来好好的，鼠标一划过整行变白。
+  */
+  --el-fill-color: #232830;
+  --el-fill-color-light: #1f242b;
+  --el-fill-color-lighter: #1b1f26;
+  --el-fill-color-extra-light: #191d23;
+  --el-fill-color-dark: #2b313a;
+  --el-fill-color-darker: #333a44;
+  /* blank 是按钮/输入框「在卡片上要看得见」的那层底，
+     用卡片色会与背景糊在一起，所以压到 muted 一档 */
+  --el-fill-color-blank: var(--color-surface-muted);
+
+  --el-mask-color: rgba(8, 10, 13, 0.75);
+  --el-mask-color-extra-light: rgba(8, 10, 13, 0.35);
+
+  --el-disabled-bg-color: #1b1f26;
+  --el-disabled-text-color: #5b6270;
+  --el-disabled-border-color: #2a3038;
+
+  --el-box-shadow: 0 12px 32px 4px rgba(0, 0, 0, 0.5), 0 8px 20px rgba(0, 0, 0, 0.4);
+  --el-box-shadow-light: 0 0 12px rgba(0, 0, 0, 0.5);
+  --el-box-shadow-lighter: 0 0 6px rgba(0, 0, 0, 0.4);
+  --el-box-shadow-dark: 0 16px 48px 16px rgba(0, 0, 0, 0.6);
+
+  /*
+    品牌色：light-3 ~ light-9 必须重算。
+
+    亮色主题里 light-9 是「品牌色向白混 90%」得到的极淡色，
+    Element Plus 用它做警告条底色、按钮 hover 底色、菜单选中底色。
+    深色页面上如果还沿用那组值，得到的就是一块块亮斑——
+    截图里那条浅米色的数据源提示，就是这么来的。
+
+    深色下改为「品牌色向背景 #171a1f 混合」，档位对应关系不变。
+  */
+  --el-color-primary: #4d9cf0;
+  --el-color-primary-light-3: #3d75b1;
+  --el-color-primary-light-5: #325b88;
+  --el-color-primary-light-7: #27415e;
+  --el-color-primary-light-8: #223449;
+  --el-color-primary-light-9: #1c2734;
+  --el-color-primary-dark-2: #3e7dc0;
+
+  --el-color-success: #67c23a;
+  --el-color-success-light-3: #4f9032;
+  --el-color-success-light-5: #3f6e2c;
+  --el-color-success-light-7: #2f4c27;
+  --el-color-success-light-8: #273c24;
+  --el-color-success-light-9: #1f2b22;
+  --el-color-success-dark-2: #529b2e;
+
+  --el-color-warning: #e6a23c;
+  --el-color-warning-light-3: #a87933;
+  --el-color-warning-light-5: #7e5e2e;
+  --el-color-warning-light-7: #554328;
+  --el-color-warning-light-8: #403526;
+  --el-color-warning-light-9: #2c2823;
+  --el-color-warning-dark-2: #b88230;
+
+  --el-color-danger: #f56c6c;
+  --el-color-danger-light-3: #b25355;
+  --el-color-danger-light-5: #864346;
+  --el-color-danger-light-7: #5a3336;
+  --el-color-danger-light-8: #432a2e;
+  --el-color-danger-light-9: #2d2227;
+  --el-color-danger-dark-2: #c45656;
+
+  /* Element Plus 内部对 error 是独立一套变量，不复用 danger 的话
+     校验失败的输入框仍会是亮红底 */
+  --el-color-error: #f56c6c;
+  --el-color-error-light-3: #b25355;
+  --el-color-error-light-5: #864346;
+  --el-color-error-light-7: #5a3336;
+  --el-color-error-light-8: #432a2e;
+  --el-color-error-light-9: #2d2227;
+  --el-color-error-dark-2: #c45656;
+
+  --el-color-info: #909399;
+  --el-color-info-light-3: #6c6c74;
+  --el-color-info-light-5: #53565c;
+  --el-color-info-light-7: #3b3e43;
+  --el-color-info-light-8: #2f3237;
+  --el-color-info-light-9: #23262b;
+  --el-color-info-dark-2: #73767a;
+
+  /* --- 顶栏导航：默认菜单底色是白色，不改就是「深色页顶白条」 --- */
+  --el-menu-bg-color: transparent;
+  --el-menu-text-color: var(--color-text-regular);
+  /* 选中项用蓝而不是红：红色在这个应用里专指「涨」，
+     拿它做导航选中色会让人误读成行情信号 */
+  --el-menu-active-color: #6cb6ff;
+  --el-menu-hover-bg-color: var(--color-surface-muted);
+  --el-menu-hover-text-color: var(--color-text-primary);
+
+  /* --- 表格：表头压一档底色；行本身透明，让卡片底色透出来 --- */
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: var(--color-surface-muted);
+  --el-table-header-text-color: var(--color-text-regular);
+  --el-table-text-color: var(--color-text-primary);
+  --el-table-border-color: var(--color-border);
+  --el-table-row-hover-bg-color: #20252d;
+  --el-table-current-row-bg-color: #232830;
+
+  /* --- 输入类：底比卡片亮一档，否则描边几乎看不见 --- */
+  --el-input-bg-color: var(--color-surface-muted);
+  --el-input-text-color: var(--color-text-primary);
+  --el-input-border-color: var(--color-border);
+  --el-input-hover-border-color: var(--color-border-strong);
+  --el-input-focus-border-color: var(--el-color-primary);
+  --el-input-placeholder-color: var(--color-text-secondary);
+
+  /* --- 下拉菜单项 --- */
+  --el-dropdown-menuItem-hover-fill: var(--color-surface-muted);
+  --el-dropdown-menuItem-hover-color: var(--color-text-primary);
+}
+
+/* 主题切换时给个过渡，避免瞬间反色刺眼。
+   只过渡颜色，不过渡布局属性——后者会让图表 resize 抖动 */
+html,
+body,
+.card,
+.metric {
+  transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html,
+  body,
+  .card,
+  .metric {
+    transition: none;
+  }
 }
 
 * {
@@ -157,4 +457,48 @@ a {
 .fade-enter-from,
 .fade-leave-to {
   opacity: 0;
+}
+
+/* ==================================================================
+   深色下的组件细节
+   ================================================================== */
+
+/*
+  卡片头在亮色下靠「白底 + 一道浅线」就能分开；
+  深色底上那条线太弱，给 header 压一层极淡的白，边界才立得住。
+  用 2% 而不是实色，是为了不把卡片切成两块。
+*/
+[data-theme='dark'] .card__header {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/*
+  密集数字的表格：表头加字距、行 hover 给过渡。
+  没有过渡时鼠标扫过整行会「啪」地变色，比不变色更干扰阅读。
+*/
+[data-theme='dark'] .el-table th.el-table__cell {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+[data-theme='dark'] .el-table tbody tr {
+  transition: background-color 0.15s ease;
+}
+
+/* 提示条统一圆角，与卡片对齐；默认 4px 在这套 8px 的卡片里显得毛糙 */
+[data-theme='dark'] .el-alert {
+  border-radius: var(--radius-md);
+}
+
+/* 深色下原生滚动条：color-scheme 已覆盖新版 Chromium，
+   这里再显式给一档，避免 Firefox / 旧 Chromium 出现亮色滚动条 */
+[data-theme='dark'] {
+  scrollbar-color: var(--color-border-strong) transparent;
+  scrollbar-width: thin;
+}
+
+/* 文字选中高亮：默认蓝色选区压在近黑底上会把文字「吃掉」 */
+[data-theme='dark'] ::selection {
+  background: rgba(77, 156, 240, 0.32);
+  color: var(--color-text-primary);
 }

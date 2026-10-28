@@ -143,7 +143,7 @@ onBeforeUnmount(() => {
 .sec-carousel :deep(.el-carousel__indicator button) {
   width: 8px;
   height: 8px;
-  background: #c9cdd4;
+  background: var(--color-border-strong);
   opacity: 0.7;
   transition: width 0.2s ease, background 0.2s ease, opacity 0.2s ease;
 }

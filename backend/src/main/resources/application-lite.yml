@@ -1,0 +1,58 @@
+# ============================================================================
+# lite profile：单机、零外部依赖（H2 文件库，不装 MySQL、不装 Redis）
+#
+# 用途：低配 / 免费云主机（1~2 GB 内存即可），以及「先看效果」的演示部署。
+#
+# 与 dev profile 的区别只有三处，别把两者混为一谈：
+#   1. H2 是**文件**库（${APP_DATA_DIR}/stockanalyst.mv.db），重启不丢数据；
+#      dev 是内存库，进程一退全清空
+#   2. H2 控制台关闭。dev 开着的 /h2-console 没有任何鉴权，
+#      公网可达的机器上等于送出一个免密的 SQL 入口
+#   3. 限流额度沿用生产默认值（严格 20/min、宽松 600/min），
+#      而不是 dev 里为冒烟脚本放宽的 3000/min
+#
+# 与 mysql profile 的取舍（选之前先想清楚）：
+#   H2 文件库**只支持单实例**，不能水平扩容，也不能多副本共享；
+#   数据量到万级、或需要多实例负载均衡时，仍应切回 mysql profile。
+#   本项目单用户/小范围使用（自选股、持仓、分析存档）完全够用。
+#
+# 启动：SPRING_PROFILES_ACTIVE=lite（docker-compose.lite.yml 已设好）
+# ============================================================================
+
+spring:
+  datasource:
+    # DB_CLOSE_DELAY=-1：JVM 存活期间保持库不关闭。文件库如果不加这个，
+    # 最后一个连接归还后库会关闭，下个请求再重新打开——每次都多一次文件锁开销。
+    # 路径用 APP_DATA_DIR 注入，容器里指向挂载卷 /app/data。
+    url: jdbc:h2:file:${APP_DATA_DIR:./data}/stockanalyst;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      # 20 是给 MySQL 用的。lite 跑在 1~2 GB 的机器上，
+      # 池子开大只会多占内存，不会更快（H2 嵌入式没有网络往返）
+      maximum-pool-size: 8
+      minimum-idle: 1
+
+  sql:
+    init:
+      # 建表统一交给 Flyway（与 dev/mysql 同一条路径，只是脚本目录按厂商分）
+      mode: never
+
+  h2:
+    console:
+      # 必须关闭：公网机器的免密 SQL 入口
+      enabled: false
+
+app:
+  jwt:
+    # 没有默认值。缺失时启动即失败（@Size(min=32) 快速失败），
+    # 这是刻意的——一个用默认密钥的公开部署等于没有鉴权。
+    secret: ${APP_JWT_SECRET:}
+
+logging:
+  level:
+    root: INFO
+    # dev 里是 DEBUG。lite 面向公网，DEBUG 会把上游 URL 与参数刷进日志，
+    # 长时间跑还会把磁盘写满
+    com.stocklab.analyst: INFO
